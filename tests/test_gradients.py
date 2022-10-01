@@ -68,7 +68,7 @@ class TestGradients(unittest.TestCase):
         g = vbayes.__gradient_gamma_cross_entropy__()
 
         ε = 1e-6
-        integrand = lambda α, β, v: - invgamma(α, scale=1/β).pdf(v) * invgamma(self.model.α, scale=1/self.model.β).logpdf(v)
+        integrand = lambda α, β, v: - invgamma(α, scale=1/β).pdf(v) * invgamma(vbayes.model.α, scale=1/vbayes.model.β).logpdf(v)
 
         Gα = quad(lambda v : (integrand(α + ε, β, v) - integrand(α - ε, β, v))/(2 * ε), 0, inf)[0]
         self.assertLess((Gα - g.α) / abs(g.α), 1e-3)
@@ -101,9 +101,9 @@ class TestGradients(unittest.TestCase):
         μ, σ = vbayes.μ, vbayes.σ
         ε = 1e-6
 
-        g = vbayes.__gradient__observations__(self.obs)
-        Gμ, Gσ = np.zeros(self.model.n), np.zeros(self.model.n)
-        for (i, j) in self.obs:
+        g = vbayes.__gradient__observations__(obs)
+        Gμ, Gσ = np.zeros(vbayes.model.n), np.zeros(vbayes.model.n)
+        for (i, j) in obs:
             """ gradient of  Σ_ij  o[i,j] ∫ Normal(μi - μj, √(σi²+σj²), δ) log(1 + e^(-δ)) dδ """
             σδ = sqrt(σ[i]**2 + σ[j]**2)
             μδ = μ[i] - μ[j]
@@ -120,6 +120,6 @@ class TestGradients(unittest.TestCase):
             true_integral = quad(true_integrand, -inf, inf)[0]
             self.assertLess(abs(approx_integral - true_integral)/true_integral, 1e-3) # dubious but we'll see
 
-        for i in range(self.model.n):
+        for i in range(vbayes.model.n):
             self.assertLess(abs(Gμ[i] - g.μ[i])/g.μ[i], 1e-3)
             self.assertLess(abs(Gσ[i] - g.σ[i])/g.σ[i], 1e-3)
