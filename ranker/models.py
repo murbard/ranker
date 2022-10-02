@@ -71,7 +71,7 @@ class Instance():
         self.n = len(z)
 
     def __repr__(self) -> str:
-        return f"Instance(v={self.v}, z={self.z})"
+        return f"Instance(√v={np.sqrt(self.v)}, z={self.z})"
 
     def observe(self, n_obs):
         obs = np.zeros((self.n, self.n))
@@ -151,64 +151,6 @@ class GradientHessian():
         return self.h[self.n:2*self.n, 2*self.n+1 : 2*self.n + 2]
 
 
-# class Gradient():
-
-#     def __init__(self, α = None, β = None, μ = None, σ = None, value = None):
-#         self.α = α
-#         self.β = β
-#         self.μ = μ
-#         self.σ = σ
-#         self.value = value
-
-
-
-#     def to_vector(self):
-#         return np.concatenate([[self.α, self.β], self.μ, self.σ])
-
-#     # addition and subtraction
-#     def __add__(self, other):
-#         def add_monad(x, y):
-#             if x is None and y is None:
-#                 return None
-#             elif x is None:
-#                 return y
-#             elif y is None:
-#                 return x
-#             else:
-#                 return x + y
-
-#         return Gradient(
-#             α = add_monad(self.α, other.α),
-#             β = add_monad(self.β, other.β),
-#             μ = add_monad(self.μ, other.μ),
-#             σ = add_monad(self.σ, other.σ),
-#             value = add_monad(self.value, other.value)
-#         )
-
-#     def __sub__(self, other):
-#         def sub_monad(x, y):
-#             if x is None and y is None:
-#                 return None
-#             elif x is None:
-#                 return -y
-#             elif y is None:
-#                 return x
-#             else:
-#                 return x - y
-#         return Gradient(
-#             α = sub_monad(self.α, other.α),
-#             β = sub_monad(self.β, other.β),
-#             μ = sub_monad(self.μ, other.μ),
-#             σ = sub_monad(self.σ, other.σ),
-#             value = sub_monad(self.value, other.value)
-#         )
-
-#     def __repr__(self) -> str:
-#         return f"Gradient(α={self.α}, β={self.β}, μ={self.μ}, σ={self.σ}, value={self.value})"
-
-#     def __str__(self) -> str:
-#         return self.__repr__()
-
 
 class VBayes():
 
@@ -257,7 +199,7 @@ class VBayes():
         gh = GradientHessian(self.n)
         gh.val = invgamma.entropy(α, scale=1/β)
         gh.gα()[0] = gα
-        gh.gβ()[0] = gβ
+        gh.gβ()[0] = gβ # negative but we subtract that so this pushes beta *down*
         gh.hαα()[0] = -polygamma(1, α) - ((1 + α) * polygamma(2, α))
         gh.hββ()[0] = 1/β**2
 
@@ -271,7 +213,7 @@ class VBayes():
 
         gh = GradientHessian(self.n)
         gh.val = norm.entropy(scale=σ).sum()
-        gh.gσ()[:] = 1 / σ
+        gh.gσ()[:] = 1 / σ # we subtract the entropy gradient, so when we minimize this pushes σ to be bigger
         gh.hσσ()[:] = np.diag(-1/σ**2)
 
         return gh
@@ -279,6 +221,8 @@ class VBayes():
 
     def __gradient_gamma_cross_entropy__(self):
         """ gradient of ∫ - InvGamma(α, β, v) log( InvGamma(α', β', v)) dv"""
+
+        # we try to mimimize this one, this means this pushes α and β towards the hyperparameter's α and β
         α, β = self.α()[0], self.β()[0]
         gα = β / self.model.β - (1 + self.model.α) * polygamma(1, α)
         gβ  = α / self.model.β - (1 + self.model.α) / β
@@ -307,7 +251,7 @@ class VBayes():
         µ, σ = self.µ(), self.σ()
         n = self.model.n
         gμ = α * β * μ
-        gσ = α * β * σ
+        gσ = α * β * σ # this pushes σ to be smaller
         gα = 1/2 * (β * (μ**2 + σ**2).sum() - n * polygamma(1, α))
         gβ = 1/2 * (α * (μ**2 + σ**2).sum() - n / β)
         value = 1/2 * (α * β * (μ**2 + σ**2).sum() + n * (log(2 * π / β) - polygamma(0, α)))
@@ -385,8 +329,8 @@ class VBayes():
 
                 gh.val -= count * (exp(-(μδ/h)**2) *  h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h)))
 
-                gμδ = - 1 / 2 * (1 - erf(μδ / h))
-                gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h)
+                gμδ = - 1 / 2 * (1 - erf(μδ / h)) # negative
+                gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h)  # negative, but this is subtracted so, so this makes σ smaller
 
                 hμμδ = - exp(-(μδ/h)**2) / (sqrt(π) * h)
                 hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3)
@@ -447,7 +391,7 @@ class VBayes():
             raise ValueError("NaN in hessian")
         return gh
 
-    def fit(self, obs, niter=100000, tol=1e-6, verbose=True):
+    def fit(self, obs, niter=100000, tol=1e-4, verbose=True):
         last_val = None
         for i in range(niter):
             gh = self.gradient(obs)
@@ -487,22 +431,33 @@ class VBayes():
             H[self.n:,self.n:] *= self.params[self.n:].reshape(-1,1).dot(self.params[self.n:].reshape(1,-1))
             G[self.n:] *= self.params[self.n:]
 
+            # don't touch α and β
+            #gh.g = gh.g[:-2]
+            #gh.h = gh.h[:-2,:-2]
+
             # newton update for the log of positive parameters
 
-            conditioning = 1e-8
+            λ = 1e-8
+
             while True:
                 try:
-                    diff = 0.1 * linalg.solve(gh.h, gh.g, assume_a='sym')
-                    break
+                    diff =  linalg.solve(gh.h + np.diag(np.diag(gh.h) * (1 + λ)), gh.g, assume_a='sym')
+
+                    old_params = self.params.copy()
+                    self.params[:self.n] -= diff[:self.n]
+                    factor = exp(-diff[self.n:])
+                    # factor[:-2] = np.clip(factor[:-2], 0.999, 1.001)
+                    self.params[self.n:] *= factor
+
+                    if self.gradient(obs).val < gh.val: # if it's better stop
+                        break
+
+                    else:
+                        self.params = old_params
+                        λ *= 10 # otherwise increase the conditioning
 
                 except RuntimeWarning as r:
-                    gh.h += conditioning * np.eye(gh.h.shape[0])
-                    conditioning *= 2
-                    print('oops, hessian is ill-conditioned', r, np.linalg.cond(gh.h))
-            self.params[:self.n] -= diff[:self.n]
-            self.params[self.n:] *= exp(-diff[self.n:])
-
-
+                    λ *= 10
 
 
 
@@ -535,7 +490,7 @@ class VBayes():
 
 
     def v95(self):
-        return sqrt(invgamma(self.α(), scale=1/self.β()).interval(0.95))
+        return sqrt(invgamma(self.α()[0], scale=1/self.β()[0]).interval(0.95))
 
     def KL(self, obs, max_iter=2000, accuracy_goal=1e-6):
         # Compute the KL divergence between the approximate posterior and the true posterior using monte carlo sampling
@@ -558,15 +513,15 @@ class VBayes():
         return (mean - interval, mean + interval)
 
     def __str__(self):
-        return f"Q(α={self.α()[0]}, β={self.β()[0]}, µ={self.µ()}, σ={self.σ()}, v~{self.v95()})"
+        return f"Q(α={self.α()[0]}, β={self.β()[0]}, µ={self.µ()}, σ={self.σ()}, √v~{self.v95()})"
 
 
 def test():
-    m = Model(n=20)
+    m = Model(n=50)
     v = VBayes(m)
 
     instance = m.rvs()
-    obs = instance.observe(400)
+    obs = instance.observe(50*50 * 20)
     print(v)
 
 
@@ -595,37 +550,52 @@ def test():
     #         print(i, ((gh2.g - gh.g) / ε)[i:] -  gh.h[i,i:],'\n\n')
     # print(max_so_far, best)
 
-    # v.fit(obs, verbose=True)
+    v.fit(obs, verbose=True)
 
     class Memoizer():
 
         def __init__(self, vbayes):
             self.gh = None
             self.vbayes = vbayes
+            self.n = vbayes.n
 
+        def adjust_params(self, params):
+            params[self.n:] = np.exp(params[self.n:])
+            return
+
+        def adjust_gh(self, gh, params):
+            self.gh.h[self.n:,self.n:] *= params[self.n:].reshape(-1,1).dot(params[self.n:].reshape(1,-1))
+            self.gh.g[self.n:] *= params[self.n:]
 
         def f(self, params):
+            self.adjust_params(params)
             if np.any(params != self.vbayes.params) or self.gh is None:
                 self.vbayes.params = params
                 self.gh = self.vbayes.gradient(obs)
+                self.adjust_gh(self.gh, params)
 
             return self.gh.val
 
         def grad(self, params):
+            self.adjust_params(params)
             if np.any(params != self.vbayes.params):
                 self.vbayes.params = params
                 self.gh = self.vbayes.gradient(obs)
-
+                self.adjust_gh(self.gh, params)
             return self.gh.g
 
         def hess(self, params):
+            self.adjust_params(params)
             if np.any(params != self.vbayes.params):
                 self.vbayes.params = params
                 self.gh = self.vbayes.gradient(obs)
+                self.adjust_gh(self.gh, params)
             return self.gh.h
 
     memo = Memoizer(v)
-    minimize(memo.f, v.params, jac=memo.grad, hess=memo.hess, method='trust-ncg', options={'maxiter': 100000, 'disp': True})
+    params = v.params.copy()
+    params[v.n:] = np.log(params[v.n:])
+    #minimize(memo.f, params, jac=memo.grad, hess=memo.hess, method='trust-ncg', options={'maxiter': 100000, 'disp': True})
 
 
 
