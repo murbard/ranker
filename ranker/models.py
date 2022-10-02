@@ -5,6 +5,7 @@ from numpy import log, sqrt, exp, linspace, array, zeros, ones, arange, pi as π
 import numpy as np
 import copy
 from scipy import linalg
+from scipy.optimize import minimize
 from matplotlib import pyplot as plt
 
 import warnings
@@ -382,7 +383,7 @@ class VBayes():
                 μδ = μ[i] - μ[j]
                 h = sqrt(16/π + 2 * σδ**2)
 
-                gh.val -= exp(-(μδ/h)**2) *  h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h))
+                gh.val -= count * (exp(-(μδ/h)**2) *  h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h)))
 
                 gμδ = - 1 / 2 * (1 - erf(μδ / h))
                 gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h)
@@ -393,6 +394,7 @@ class VBayes():
 
                 gh.gμ()[i] += count * (-gμδ)
                 gh.gμ()[j] += count * gμδ
+
                 gh.gσ()[i] += count * (gσδ * σ[i] / σδ)
                 gh.gσ()[j] += count * (gσδ * σ[j] / σδ)
 
@@ -453,18 +455,25 @@ class VBayes():
                 break
             last_val = gh.val
 
-            ε = np.random.randn(2 * self.n + 2) * 1e-12
-            ε[self.n:] = 0.0 # let's see if mu works
+            # BEGIN TEST
+            # gh1 = self.__gradient_observations__(obs)
+            # ε = np.random.randn(2 * self.n + 2) * 1e-5
+            # ε[1:] = 0.0 # let's see if mu works
 
-            self.params += ε
-            gh2 = self.gradient(obs)
-            self.params -= ε
+            # self.params += ε
+            # gh2 = self.__gradient_observations__(obs)
+            # self.params -= ε
 
-            first_order = gh.g.dot(ε)
-            second_order = ε.dot(gh.h).dot(ε) - 0.5 * ((ε * np.diag(gh.h)).dot(ε))
-            actual = gh2.val - gh.val
-            print(actual, first_order)
-            print(actual - first_order, second_order)
+            # first_order = gh1.g.dot(ε)
+            # second_order = ε.dot(gh1.h - 0.5 * np.diag(np.diag(gh1.h))).dot(ε)
+            # actual = gh2.val - gh1.val
+            # if np.abs(actual) > 1e-20 and np.abs((actual - first_order)) > 1e-20:
+            #     error = np.abs(actual - first_order) / np.abs(actual)
+            #     print(f"first order relative error : {error}")
+            #     second_order_error = np.abs((actual - first_order) - second_order) / np.abs(actual - first_order)
+            #     print(f"second order relative error : {second_order_error}")
+
+            # END TEST
 
 
             # Newton step
@@ -472,15 +481,40 @@ class VBayes():
             # check the condition number of gh.h
 
 
+            G = gh.g
+            H = gh.h
 
-            try:
-                self.params -= linalg.solve(gh.h, gh.g, assume_a='sym')
-            except RuntimeWarning as r:
-                print('oops, hessian is ill-conditioned', r, np.linalg.cond(gh.h))
+            H[self.n:,self.n:] *= self.params[self.n:].reshape(-1,1).dot(self.params[self.n:].reshape(1,-1))
+            G[self.n:] *= self.params[self.n:]
+
+            # newton update for the log of positive parameters
+
+            conditioning = 1e-8
+            while True:
+                try:
+                    diff = 0.1 * linalg.solve(gh.h, gh.g, assume_a='sym')
+                    break
+
+                except RuntimeWarning as r:
+                    gh.h += conditioning * np.eye(gh.h.shape[0])
+                    conditioning *= 2
+                    print('oops, hessian is ill-conditioned', r, np.linalg.cond(gh.h))
+            self.params[:self.n] -= diff[:self.n]
+            self.params[self.n:] *= exp(-diff[self.n:])
+
+
+
 
 
             # Sanity clamp α, β, σ to be positive
-            self.params[self.n:] = np.clip(self.params[self.n:], 1e-6, inf)
+            #self.params[self.n:] = np.clip(self.params[self.n:], 1e-6, inf)
+
+            # Todo remove, prevent a and b from collpasing to see if that causes the ill conditioning
+
+
+
+            #self.params[-1] = np.clip(self.params[-1], 0.01, inf)
+            #self.params[-2] = np.clip(self.params[-1], 0.01, inf)
 
 
 
@@ -495,8 +529,8 @@ class VBayes():
             #self.α = np.maximum(self.α, 1e-6)
             #self.β = np.maximum(self.β, 1e-6)
 
-            if verbose and i%100 == 0:
-                print(self, gh.val) # , "KL~", self.KL(obs))
+            if verbose:
+                print(gh.val) # , "KL~", self.KL(obs))
 
 
 
@@ -528,11 +562,11 @@ class VBayes():
 
 
 def test():
-    m = Model(n=50)
+    m = Model(n=20)
     v = VBayes(m)
 
     instance = m.rvs()
-    obs = instance.observe(200)
+    obs = instance.observe(400)
     print(v)
 
 
@@ -561,7 +595,41 @@ def test():
     #         print(i, ((gh2.g - gh.g) / ε)[i:] -  gh.h[i,i:],'\n\n')
     # print(max_so_far, best)
 
-    v.fit(obs, verbose=True)
+    # v.fit(obs, verbose=True)
+
+    class Memoizer():
+
+        def __init__(self, vbayes):
+            self.gh = None
+            self.vbayes = vbayes
+
+
+        def f(self, params):
+            if np.any(params != self.vbayes.params) or self.gh is None:
+                self.vbayes.params = params
+                self.gh = self.vbayes.gradient(obs)
+
+            return self.gh.val
+
+        def grad(self, params):
+            if np.any(params != self.vbayes.params):
+                self.vbayes.params = params
+                self.gh = self.vbayes.gradient(obs)
+
+            return self.gh.g
+
+        def hess(self, params):
+            if np.any(params != self.vbayes.params):
+                self.vbayes.params = params
+                self.gh = self.vbayes.gradient(obs)
+            return self.gh.h
+
+    memo = Memoizer(v)
+    minimize(memo.f, v.params, jac=memo.grad, hess=memo.hess, method='trust-ncg', options={'maxiter': 100000, 'disp': True})
+
+
+
+
     print(v, instance)
     from matplotlib import pyplot as plt
     plt.scatter(v.μ(), instance.z)
