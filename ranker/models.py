@@ -12,9 +12,11 @@ import warnings
 warnings.filterwarnings("error")
 from line_profiler import LineProfiler
 
-
-def log_expit(x):
-   return  -log(1 + exp(-np.abs(x))) + min(x, 0)
+try:
+    from scipy.special import log_expit
+except ImportError:
+    def log_expit(x):
+        return  -log(1 + exp(-np.abs(x))) + min(x, 0)
 
 
 def almost_log_expit(x):
@@ -192,6 +194,9 @@ class VBayes():
 
     def logQ(self, instance):
         return invgamma(self.α()[0], scale=1/self.β()[0]).logpdf(instance.v) + norm(loc=self.µ(), scale=self.σ()).logpdf(instance.z).sum()
+
+    def entropy(self):
+        return invgamma(self.α(), scale=1/self.β()).entropy() + norm(loc=self.μ(), scale=self.σ()).entropy().sum()
 
     def rvs(self):
         return Instance(invgamma.rvs(self.α()[0], scale=1/self.β()[0]), norm.rvs(loc=self.µ(), scale=self.σ()))
@@ -394,52 +399,24 @@ class VBayes():
             raise ValueError("NaN in hessian")
         return gh
 
-    def fit(self, obs, niter=100000, tol=1e-6, verbose=True):
+    def fit(self, obs, niter=100000, tol=1e-6, verbose=True, λ0 = 1e-4):
         last_val = None
         for _ in range(niter):
             gh = self.eval(obs, compute_gradient=True, compute_hessian=True)
-            if last_val and np.abs(last_val - gh.val)/np.abs(gh.val) < tol:
+            if last_val and np.abs(last_val - gh.val)/np.abs(gh.val) < tol and λ == λ0: # don't stop if we're still dampening the hessian
                 break
             last_val = gh.val
 
-            # BEGIN TEST
-            # gh1 = self.__gradient_observations__(obs)
-            # ε = np.random.randn(2 * self.n + 2) * 1e-5
-            # ε[1:] = 0.0 # let's see if mu works
 
-            # self.params += ε
-            # gh2 = self.__gradient_observations__(obs)
-            # self.params -= ε
-
-            # first_order = gh1.g.dot(ε)
-            # second_order = ε.dot(gh1.h - 0.5 * np.diag(np.diag(gh1.h))).dot(ε)
-            # actual = gh2.val - gh1.val
-            # if np.abs(actual) > 1e-20 and np.abs((actual - first_order)) > 1e-20:
-            #     error = np.abs(actual - first_order) / np.abs(actual)
-            #     print(f"first order relative error : {error}")
-            #     second_order_error = np.abs((actual - first_order) - second_order) / np.abs(actual - first_order)
-            #     print(f"second order relative error : {second_order_error}")
-
-            # END TEST
-
-
-            # Newton step
-
-            # check the condition number of gh.h
-
-
-
+            # newton update for the log of positive parameters
             gh.h[self.n:,self.n:] *= self.params[self.n:].reshape(-1,1).dot(self.params[self.n:].reshape(1,-1))
             gh.g[self.n:] *= self.params[self.n:]
             gh.h[self.n:,self.n:] += np.diag(gh.g[self.n:])
 
-
-            # newton update for the log of positive parameters
-
-            λ = 1e-4
+            λ = λ0
 
             if np.any(np.diag(gh.h) < 0):
-                print("negative diagonal")
+                raise "negative diagonal"
 
             while True:
                 try:
@@ -448,11 +425,10 @@ class VBayes():
                     old_params = self.params.copy()
                     self.params[:self.n] -= diff[:self.n]
                     factor = exp(-diff[self.n:])
-                    # factor[:-2] = np.clip(factor[:-2], 0.999, 1.001)
                     self.params[self.n:] *= factor
 
                     if self.eval(obs).val < gh.val: # if it's better stop
-                        if verbose and λ > 1e-4:
+                        if verbose and λ > λ0:
                             print(f"λ = {λ}")
                         break
 
@@ -463,28 +439,15 @@ class VBayes():
                 except RuntimeWarning as r:
                     λ *= 10
 
-
-
-            # Sanity clamp α, β, σ to be positive
-            #self.params[self.n:] = np.clip(self.params[self.n:], 1e-6, inf)
-
-            # Todo remove, prevent a and b from collpasing to see if that causes the ill conditioning
-
-
-
-            #self.params[-1] = np.clip(self.params[-1], 0.01, inf)
-            #self.params[-2] = np.clip(self.params[-1], 0.01, inf)
-
-
-
-            # to check gradients
-            #new_val = self.gradient(obs).value
-            #print((new_val - gradient.value), -lr * (gradient.α**2 + gradient.β**2 + (gradient.σ**2 + gradient.µ**2).sum()))
-
             if verbose:
                 print(gh.val, (self.σ()**2).mean() ) # , "KL~", self.KL(obs))
 
 
+    def prob_win(self, i, j):
+        # Compute the probability that player i beats player j
+        μ = self.µ()[i] - self.µ()[j]
+        σ = sqrt(self.σ()[i]**2 + self.σ()[j]**2)
+        return 1/2 * (1 + erf(sqrt(π) * μ / (4 * sqrt(1 + π * σ**2 / 8))))
 
 
     def v95(self):
@@ -536,7 +499,11 @@ def test():
             for j in range(i + 1 , m.n):
                 ifwin = (factor[m.n + i] * v.σ()[i] + factor[m.n + j] * dobs[i,j,0] * v.σ()[j]) * dobs[i,j,0] + (factor[i] - factor[j]) * dobs[i,j,1]  * dobs[i,j,1]
                 iflose = (factor[m.n +j] * v.σ()[j] + factor[m.n + i] * dobs[j,i,0] * v.σ()[j]) * dobs[j,i,0] + (factor[j] - factor[i]) * dobs[j,i,1]  * dobs[j,i,1]
-                gain = ifwin * 0.5 + iflose * 0.5
+                p = v.prob_win(i, j)
+
+                gain = p * ifwin * 0.5 + (1 - p) * iflose
+                if gain > 0:
+                    print(f"What's up, gain = {gain} > 0??")
                 if gain < best_gain:
                     best_gain = gain
                     best_pair = (i, j)
@@ -549,6 +516,7 @@ def test():
 
 
     plt.errorbar(x=instance.z,y=v.μ(),yerr=1.96 * v.σ(),fmt='.')
+
     plt.show()
 
 
@@ -567,4 +535,3 @@ if __name__ == '__main__':
     # lp_wrapper()
     # lp.print_stats()
     test()
-
