@@ -10,6 +10,8 @@ from matplotlib import pyplot as plt
 
 import warnings
 warnings.filterwarnings("error")
+from line_profiler import LineProfiler
+
 
 
 
@@ -190,106 +192,91 @@ class VBayes():
         return Instance(invgamma.rvs(self.α()[0], scale=1/self.β()[0]), norm.rvs(loc=self.µ(), scale=self.σ()))
 
 
-    def __gradient_invgamma_entropy__(self):
+    def __minus_invgamma_entropy__(self, compute_gradient = True, compute_hessian = True, out = None):
         """" The gradient of the entropy of an inverse gamma distribution with respect to its parameters. """
+        
         α, β = self.α()[0], self.β()[0]
-        gα = 1 - (1 + α) * polygamma(1, α)
-        gβ = - 1 / β
+        
+        gh = out if out is not None else GradientHessian(self.n)
 
-        gh = GradientHessian(self.n)
-        gh.val = invgamma.entropy(α, scale=1/β)
-        gh.gα()[0] = gα
-        gh.gβ()[0] = gβ # negative but we subtract that so this pushes beta *down*
-        gh.hαα()[0] = -polygamma(1, α) - ((1 + α) * polygamma(2, α))
-        gh.hββ()[0] = 1/β**2
+        gh.val -= invgamma.entropy(α, scale=1/β)
 
-        #return Gradient(α = gα, β = gβ, value = invgamma.entropy(α, scale=1/β))
+        if compute_gradient:                    
+            gh.gα()[0] += (1 + α) * polygamma(1, α) - 1
+            gh.gβ()[0] += 1 / β
+
+        if compute_hessian:
+            gh.hαα()[0] += polygamma(1, α) + ((1 + α) * polygamma(2, α))
+            gh.hββ()[0] += - 1 / β**2
+        
         return gh
 
-    def __gradient_normal_entropy__(self):
+    def __minus_normal_entropy__(self, compute_gradient = True, compute_hessian = True, out = None):
         """ The gradient of the entropy of a normal distribution with respect to its parameters. """
         σ = self.σ()
-        #  gµ = zeros(self.model.n) # µ does not contribute to the entropy
+        
+        gh = out if out is not None else GradientHessian(self.n)            
+        
+        gh.val -= norm.entropy(scale=σ).sum()
+        if compute_gradient:            
+            gh.gσ()[:] += - 1 / σ # we subtract the entropy gradient, so when we minimize this pushes σ to be bigger
+        if compute_hessian:
+            gh.hσσ()[:] += np.diag(1 / σ**2)
 
-        gh = GradientHessian(self.n)
-        gh.val = norm.entropy(scale=σ).sum()
-        gh.gσ()[:] = 1 / σ # we subtract the entropy gradient, so when we minimize this pushes σ to be bigger
-        gh.hσσ()[:] = np.diag(-1/σ**2)
+        return gh        
 
-        return gh
-        #return Gradient(µ = gµ, σ = gσ, value = norm.entropy(scale=σ).sum())
-
-    def __gradient_gamma_cross_entropy__(self):
+    def __gamma_cross_entropy__(self, compute_gradient = True, compute_hessian = True, out = None):
         """ gradient of ∫ - InvGamma(α, β, v) log( InvGamma(α', β', v)) dv"""
 
         # we try to mimimize this one, this means this pushes α and β towards the hyperparameter's α and β
         α, β = self.α()[0], self.β()[0]
-        gα = β / self.model.β - (1 + self.model.α) * polygamma(1, α)
-        gβ  = α / self.model.β - (1 + self.model.α) / β
-        value = α * β / self.model.β + self.model.α * log(self.model.β) + gammaln(self.model.α) - (1 + self.model.α) * (log(β) + polygamma(0, α))
 
-        gαα = -(1 + self.model.α) * polygamma(2, α)
-        gββ = (1 + self.model.α) / β**2
-        gαβ = 1 / self.model.β
+        gh = out if out is not None else GradientHessian(self.n)    
 
-        gh = GradientHessian(self.n)
-        gh.val = value
+        gh.val += α * β / self.model.β + self.model.α * log(self.model.β) + gammaln(self.model.α) - (1 + self.model.α) * (log(β) + polygamma(0, α))
 
-        gh.gα()[0] = gα
-        gh.gβ()[0] = gβ
-        gh.hαα()[0] = gαα
-        gh.hββ()[0] = gββ
-        gh.hαβ()[0] = gαβ
+        if compute_gradient:
+            gh.gα()[0] += β / self.model.β - (1 + self.model.α) * polygamma(1, α)
+            gh.gβ()[0] += α / self.model.β - (1 + self.model.α) / β
+        
+        if compute_hessian:
+            gh.hαα()[0] += -(1 + self.model.α) * polygamma(2, α)
+            gh.hββ()[0] += (1 + self.model.α) / β**2
+            gh.hαβ()[0] += 1 / self.model.β
 
         return gh
 
-        #return Gradient(α = gα, β = gβ, value = value)
-
-    def __gradient_normal_cross_entropy__(self):
+    def __normal_cross_entropy__(self, compute_gradient = False, compute_hessian = False, out = None):
         """ gradient of ∫∫ - InvGamma(α, β, v) Normal(μ, σ, z) log(Normal(0, √v)) dv dz """
         α, β = self.α()[0], self.β()[0]
         µ, σ = self.µ(), self.σ()
         n = self.model.n
-        gμ = α * β * μ
-        gσ = α * β * σ # this pushes σ to be smaller
-        gα = 1/2 * (β * (μ**2 + σ**2).sum() - n * polygamma(1, α))
-        gβ = 1/2 * (α * (μ**2 + σ**2).sum() - n / β)
-        value = 1/2 * (α * β * (μ**2 + σ**2).sum() + n * (log(2 * π / β) - polygamma(0, α)))
+        
+        gh = out if out is not None else GradientHessian(self.n)    
 
-        gh = GradientHessian(self.n)
-        gh.val = value
-        gh.gα()[0] = gα
-        gh.gβ()[0] = gβ
-        gh.gμ()[:] = gμ
-        gh.gσ()[:] = gσ
+        gh.val += 1/2 * (α * β * (μ**2 + σ**2).sum() + n * (log(2 * π / β) - polygamma(0, α)))
 
+        if compute_gradient:        
+            gh.gμ()[:] += α * β * μ
+            gh.gσ()[:] += α * β * σ # this pushes σ to be smaller
+            gh.gα()[0] += 1/2 * (β * (μ**2 + σ**2).sum() - n * polygamma(1, α))
+            gh.gβ()[0] += 1/2 * (α * (μ**2 + σ**2).sum() - n / β)
 
-        hαα = - 1 / 2 * n * polygamma(2, α)
-        hαβ = 1/2 * (μ**2 + σ**2).sum()
-        hββ = n / (2 * β**2)
-        hμα = β * μ
-        hμβ = α * μ
-        hσα = β * σ
-        hσβ = α * σ
-        hμμ = α * β * np.eye(n)
-        hσσ = α * β * np.eye(n)
-
-        gh.hαα()[0] = hαα
-        gh.hαβ()[0] = hαβ
-        gh.hββ()[0] = hββ
-        gh.hμα()[:,0] = hμα
-        gh.hμβ()[:,0] = hμβ
-        gh.hσα()[:,0] = hσα
-        gh.hσβ()[:,0] = hσβ
-        gh.hμμ()[:] = hμμ
-        gh.hσσ()[:] = hσσ
+        if compute_hessian:            
+            gh.hαα()[0] += - 1 / 2 * n * polygamma(2, α)
+            gh.hαβ()[0] += 1/2 * (μ**2 + σ**2).sum()
+            gh.hββ()[0] += n / (2 * β**2)
+            gh.hμα()[:,0] += β * μ
+            gh.hμβ()[:,0] += α * μ
+            gh.hσα()[:,0] += β * σ
+            gh.hσβ()[:,0] += α * σ
+            gh.hμμ()[:] += α * β * np.eye(n)
+            gh.hσσ()[:] += α * β * np.eye(n)
 
         return gh
 
-        # return Gradient(α = gα, β = gβ, μ = gμ, σ = gσ, value = value)
-
-    def __gradient_observations__(self, obs):
-        """ gradient of  Σ_ij  o[i,j] ∫ Normal(μi - μj, √(σi²+σj²), δ) log(1 + e^(-δ)) dδ """
+    def __minus_observations__(self, obs, compute_gradient = True, compute_hessian = True, out = None):
+        """ Σ_ij  o[i,j] ∫ Normal(μi - μj, √(σi²+σj²), δ) log(1 + e^(-δ)) dδ """
         # let σ = √(σi²+σj²) and μ = μi - μj
         # dμ / dμi = 1
         # dμ / dμj = -1
@@ -311,56 +298,57 @@ class VBayes():
         # note: if f(a,b) = g(c(a,b)) then
         # d²f/dadb = d²g/dc² (dc/da)(dc/db) + dg/dc d²c/(da db)
 
+        assert(compute_gradient or not compute_hessian)
+
         µ, σ = self.µ(), self.σ()
 
-        gh = GradientHessian(self.n)
+        gh = out if out is not None else GradientHessian(self.n)    
+        
         for i in range(0, self.n):
             for j in range(0, self.n):
-
                 if obs[i, j] == 0:
                     continue
                 else:
                     count = obs[i, j]
 
-
                 σδ = sqrt(σ[i]**2 + σ[j]**2)
                 μδ = μ[i] - μ[j]
                 h = sqrt(16/π + 2 * σδ**2)
 
-                gh.val -= count * (exp(-(μδ/h)**2) *  h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h)))
+                gh.val += count * (exp(-(μδ/h)**2) *  h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h)))
 
-                gμδ = - 1 / 2 * (1 - erf(μδ / h)) # negative
-                gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h)  # negative, but this is subtracted so, so this makes σ smaller
+                if compute_gradient:
 
-                hμμδ = - exp(-(μδ/h)**2) / (sqrt(π) * h)
-                hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3)
-                hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + μδ**2)) / (π**(5/2) * h**5)
+                
+                    gμδ = - 1 / 2 * (1 - erf(μδ / h)) # negative
+                    gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h)  # negative, but this is subtracted so, so this makes σ smaller
+                    
+                    gh.gμ()[i] -= count * (-gμδ)
+                    gh.gμ()[j] -= count * gμδ
 
-                gh.gμ()[i] += count * (-gμδ)
-                gh.gμ()[j] += count * gμδ
+                    gh.gσ()[i] -= count * (gσδ * σ[i] / σδ)
+                    gh.gσ()[j] -= count * (gσδ * σ[j] / σδ)
 
-                gh.gσ()[i] += count * (gσδ * σ[i] / σδ)
-                gh.gσ()[j] += count * (gσδ * σ[j] / σδ)
+                    if compute_hessian:
+                        hμμδ = - exp(-(μδ/h)**2) / (sqrt(π) * h)
+                        hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3)
+                        hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + μδ**2)) / (π**(5/2) * h**5)
 
-                gh.hμμ()[i,i] += count * hμμδ
-                gh.hμμ()[j,j] += count * hμμδ
-                gh.hμμ()[min(i,j), max(i,j)] += count * (-hμμδ)
+                        gh.hμμ()[i,i] -= count * hμμδ
+                        gh.hμμ()[j,j] -= count * hμμδ
+                        gh.hμμ()[min(i,j), max(i,j)] -= count * (-hμμδ)
 
-                gh.hσσ()[i,i] += count * (hσσδ * (σ[i]/σδ)**2 + gσδ * σ[j]**2/σδ**3)
-                gh.hσσ()[min(i,j), max(i,j)] += count * (hσσδ * (σ[i]*σ[j] / σδ**2) - gσδ * σ[i]*σ[j] / σδ**3)
-                gh.hσσ()[j,j] += count * (hσσδ * (σ[j]/σδ)**2 + gσδ * σ[i]**2/σδ**3)
+                        gh.hσσ()[i,i] -= count * (hσσδ * (σ[i]/σδ)**2 + gσδ * σ[j]**2/σδ**3)
+                        gh.hσσ()[min(i,j), max(i,j)] -= count * (hσσδ * (σ[i]*σ[j] / σδ**2) - gσδ * σ[i]*σ[j] / σδ**3)
+                        gh.hσσ()[j,j] -= count * (hσσδ * (σ[j]/σδ)**2 + gσδ * σ[i]**2/σδ**3)
 
-                gh.hμσ()[i,i] += count * hμσδ * σ[i] / σδ
-                gh.hμσ()[i,j] += count * hμσδ * σ[j] / σδ
-                gh.hμσ()[j,i] += count *  (-hμσδ * σ[i] / σδ)
-                gh.hμσ()[j,j] += count *  (-hμσδ * σ[j] / σδ)
-
-
-        # return Gradient(μ = gμ, σ = gσ, value = value)
-
+                        gh.hμσ()[i,i] -= count * hμσδ * σ[i] / σδ
+                        gh.hμσ()[i,j] -= count * hμσδ * σ[j] / σδ
+                        gh.hμσ()[j,i] -= count *  (-hμσδ * σ[i] / σδ)
+                        gh.hμσ()[j,j] -= count *  (-hμσδ * σ[j] / σδ)    
         return gh
 
-    def gradient(self, obs):
+    def eval(self, obs, compute_gradient = False, compute_hessian = False):
         # Compute the gradient of the paramters (µ, σ, α, β) with respect to the KL divergence
         # of the approximate posterior with the true posterior.
 
@@ -370,20 +358,20 @@ class VBayes():
         gh = GradientHessian(self.n)
 
         # ∫ - InvGamma(α, β, v) log(InvGamma(α, β, v))
-        gh -= self.__gradient_invgamma_entropy__()
+        self.__minus_invgamma_entropy__(compute_gradient, compute_hessian, out=gh)
 
 
         # ∫ - InvGamma(α, β, v) log(InvGamma(α, β, v))
-        gh -= self.__gradient_normal_entropy__()
+        self.__minus_normal_entropy__(compute_gradient, compute_hessian, out=gh)
 
         # ∫ - InvGamma(α, β, v) log( InvGamma(α', β', v)) dv
-        gh += self.__gradient_gamma_cross_entropy__()
+        self.__gamma_cross_entropy__(compute_gradient, compute_hessian, out=gh)
 
         # ∫∫ - InvGamma(α, β, v) Normal(μ, σ, z) log(Normal(0, √v)) dv dz
-        gh += self.__gradient_normal_cross_entropy__()
+        self.__normal_cross_entropy__(compute_gradient, compute_hessian, out=gh)
 
         # Σ_ij  o[i,j] ∫ Normal(μi - μj, √(σi²+σj²), δ) log(1 + e^(-δ)) dδ
-        gh -= self.__gradient_observations__(obs)
+        self.__minus_observations__(obs, compute_gradient, compute_hessian, out=gh)
 
         if np.any(np.isnan(gh.g)):
             raise ValueError("NaN in gradient")
@@ -393,8 +381,8 @@ class VBayes():
 
     def fit(self, obs, niter=100000, tol=1e-4, verbose=True):
         last_val = None
-        for i in range(niter):
-            gh = self.gradient(obs)
+        for _ in range(niter):
+            gh = self.eval(obs, compute_gradient=True, compute_hessian=True)
             if last_val and np.abs(last_val - gh.val)/np.abs(gh.val) < tol:
                 break
             last_val = gh.val
@@ -425,19 +413,18 @@ class VBayes():
             # check the condition number of gh.h
 
 
-            G = gh.g
-            H = gh.h
+            
+            gh.h[self.n:,self.n:] *= self.params[self.n:].reshape(-1,1).dot(self.params[self.n:].reshape(1,-1))
+            gh.g[self.n:] *= self.params[self.n:]
+            gh.h[self.n:,self.n:] += np.diag(gh.g[self.n:])
 
-            H[self.n:,self.n:] *= self.params[self.n:].reshape(-1,1).dot(self.params[self.n:].reshape(1,-1))
-            G[self.n:] *= self.params[self.n:]
-
-            # don't touch α and β
-            #gh.g = gh.g[:-2]
-            #gh.h = gh.h[:-2,:-2]
 
             # newton update for the log of positive parameters
 
-            λ = 1e-8
+            λ = 1e-4
+
+            if np.any(np.diag(gh.h) < 0):
+                print("negative diagonal")                
 
             while True:
                 try:
@@ -449,7 +436,9 @@ class VBayes():
                     # factor[:-2] = np.clip(factor[:-2], 0.999, 1.001)
                     self.params[self.n:] *= factor
 
-                    if self.gradient(obs).val < gh.val: # if it's better stop
+                    if self.eval(obs).val < gh.val: # if it's better stop
+                        if verbose and λ > 1e-4:
+                            print(f"λ = {λ}")
                         break
 
                     else:
@@ -485,7 +474,8 @@ class VBayes():
             #self.β = np.maximum(self.β, 1e-6)
 
             if verbose:
-                print(gh.val) # , "KL~", self.KL(obs))
+                print(gh.val, (self.σ()**2).mean() ) # , "KL~", self.KL(obs))
+                
 
 
 
@@ -521,7 +511,7 @@ def test():
     v = VBayes(m)
 
     instance = m.rvs()
-    obs = instance.observe(50*50 * 20)
+    obs = instance.observe(50*50 * 2)
     print(v)
 
 
@@ -602,9 +592,23 @@ def test():
 
     print(v, instance)
     from matplotlib import pyplot as plt
-    plt.scatter(v.μ(), instance.z)
-    plt.show()
+    #plt.errorbar(x=instance.z,y=v.μ(),yerr=1.96 * v.σ(),fmt='.')
+    #plt.show()
+
+    #print(v.KL(obs))
+    
 
 
 if __name__ == '__main__':
-    test()
+    lp = LineProfiler()
+    lp.add_function(VBayes.eval)
+    lp.add_function(VBayes.fit)
+    lp.add_function(VBayes.__minus_invgamma_entropy__)
+    lp.add_function(VBayes.__minus_normal_entropy__)
+    lp.add_function(VBayes.__gamma_cross_entropy__)
+    lp.add_function(VBayes.__normal_cross_entropy__)
+    lp.add_function(VBayes.__minus_observations__)
+    lp_wrapper = lp(test)
+    lp_wrapper()
+    lp.print_stats()
+    
