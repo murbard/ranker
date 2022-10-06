@@ -1,7 +1,7 @@
 from scipy.stats import invgamma, norm
 from scipy.special import gammaln, gamma, polygamma, erf, erfc, expit
 from scipy.integrate import quad
-from numpy import log, sqrt, exp, linspace, array, zeros, ones, arange, pi as π, inf
+from numpy import log, sqrt, exp, linspace, array, zeros, ones, arange, pi as π, inf, sign
 import numpy as np
 import copy
 from scipy import linalg
@@ -95,6 +95,7 @@ class Instance():
 
     def match(self, i, j):
         return np.random.rand() < expit(self.z[i] - self.z[j])
+
 
 class GradientHessian():
 
@@ -229,7 +230,7 @@ class VBayes():
         """ The gradient of the entropy of a normal distribution with respect to its parameters. """
         σ = self.σ()
 
-        gh = out if out is not None else GradientfHessian(self.n)
+        gh = out if out is not None else GradientHessian(self.n)
 
         gh.val -= norm.entropy(scale=σ).sum()
         if compute_gradient:
@@ -349,7 +350,7 @@ class VBayes():
 
                     if dobs is not None:
                             dobs[i,j, 0] = - gσδ  / σδ
-                            dobs[i, j, 1] = - gμδ
+                            dobs[i, j, 1] = gμδ
 
                     if compute_hessian:
 
@@ -403,11 +404,13 @@ class VBayes():
             raise ValueError("NaN in hessian")
         return gh
 
-    def fit(self, obs, niter=100000, tol=1e-6, verbose=True, λ0 = 1e-4):
+    def fit(self, obs, niter=100000, tol=1e-8, verbose=True, λ0 = 1e-4):
         last_val = None
         for _ in range(niter):
+            λ = λ0
             gh = self.eval(obs, compute_gradient=True, compute_hessian=True)
-            if last_val and np.abs(last_val - gh.val)/np.abs(gh.val) < tol and λ == λ0: # don't stop if we're still dampening the hessian
+            if last_val and np.abs(last_val - gh.val)/np.abs(gh.val) < tol and λ == λ0 or λ > 10000: # don't stop if we're still dampening the hessian, but do stop
+                # if it's gone too far
                 break
             last_val = gh.val
 
@@ -416,7 +419,7 @@ class VBayes():
             gh.g[self.n:] *= self.params[self.n:]
             gh.h[self.n:,self.n:] += np.diag(gh.g[self.n:])
 
-            λ = λ0
+
 
             if np.any(np.diag(gh.h) < 0):
                 raise "negative diagonal"
@@ -483,48 +486,112 @@ class VBayes():
     def __str__(self):
         return f"Q(α={self.α()[0]}, β={self.β()[0]}, µ={self.µ()}, σ={self.σ()}, √v~{self.v95()})"
 
+    def __repr__(self):
+        return self.__str__()
+
+    def expected_inversions(self, gradient=None):
+        μ = self.μ()
+        σ = self.σ()
+
+
+        # Compute the expected number of inversions in the approximate posterior
+        inversions = 0
+        for i in range(self.n):
+            for j in range(i+1, self.n):
+                σδ = sqrt(σ[i]**2 + σ[j]**2)
+                μδ = μ[i] - μ[j]
+                z = abs(μδ) / σδ
+
+                # inverse normal cdf of z
+                inversions += 0.5 * erfc(z / sqrt(2))
+                if gradient is not None:
+                    dinv_dz = - exp(-z**2 / 2) / sqrt(2 * π)
+                    dinv_dμi = dinv_dz * sign(μδ) / σδ
+                    dinv_dμj = - dinv_dμi
+                    dinv_dσi = - dinv_dz * σ[i] / (σδ**3)
+                    dinv_dσj = - dinv_dz * σ[j] / (σδ**3)
+                    gradient[i] += dinv_dμi
+                    gradient[j] += dinv_dμj
+                    gradient[self.n + i] += dinv_dσi
+                    gradient[self.n + j] += dinv_dσj
+
+        return inversions
+
+    def actual_inversions(self, instance):
+        μ = self.μ()
+        inversions = 0
+        for i in range(self.n):
+            for j in range(i+1, self.n):
+                if (μ[i] - μ[j]) * (instance.z[i] - instance.z[j]) <= 0:
+                    inversions += 1
+        return inversions
+
+
+    def best_pair(self, obs, target='expected_inversions'):
+
+        self.fit(verbose=False, obs=obs, tol=1e-12)
+        dobs = np.zeros((self.n, self.n, 2))
+        gh = self.eval(obs,compute_gradient=True,compute_hessian=True, dobs=dobs)
+
+        targets = ['expected_inversions', 'sum_of_variances']
+        match target:
+            case 'sum_of_variances':
+                df_dparam = np.concatenate([np.zeros(self.n), 2 * self.σ(), np.zeros(2)])
+            case 'expected_inversions':
+                df_dparam = np.zeros(2 * self.n + 2)
+                _ = self.expected_inversions(gradient=df_dparam)
+            case _:
+                raise ValueError(f"target must be one of {targets}")
+
+        factor = -linalg.solve(gh.h, df_dparam, assume_a='sym')
+
+        best_gain, best_ifwin, best_iflose = 0.0, 0.0, 0.0
+        best_pair = None
+        for i in range(self.n):
+            for j in range(i + 1 , self.n):
+                ifwin  = (factor[self.n + i] * self.σ()[i] + factor[self.n + j] * self.σ()[j]) * dobs[i,j,0] + (factor[i] - factor[j]) * dobs[i,j,1]
+                iflose = (factor[self.n + j] * self.σ()[j] + factor[self.n + i] * self.σ()[i]) * dobs[j,i,0] + (factor[j] - factor[i]) * dobs[j,i,1]
+                p = self.prob_win(i, j)
+
+                gain = p * ifwin + (1 - p) * iflose
+                if gain > 0:
+                    pass
+                    # print(f"What's up, gain = {gain} > 0??")
+                if gain < best_gain:
+                    best_gain = gain
+                    best_ifwin = ifwin
+                    best_iflose = iflose
+                    best_pair = (i, j)
+
+        return best_pair
+
+
+
+
 
 def test():
     m = Model(n=10)
     v = VBayes(m)
 
     instance = m.rvs()
-    obs = instance.observe(400)
+    obs = instance.observe(0)
 
-    squares =  np.sum(v.σ()**2)
-    for _ in range(200):
 
-        v.fit(obs, verbose=False)
-        dobs = np.zeros((m.n, m.n, 2))
-        gh = v.eval(obs,compute_gradient=True,compute_hessian=True, dobs=dobs)
-        plt.errorbar(x=instance.z,y=v.μ(),yerr=1.96 * v.σ(),fmt='.')
-        plt.show()
-        factor = -linalg.solve(gh.h, np.concatenate([np.zeros(m.n), v.σ(), np.zeros(2)]), assume_a='sym')
-        best_gain = 0.0
-        best_pair = None
-        for i in range(m.n):
-            for j in range(i + 1 , m.n):
-                ifwin = (factor[m.n + i] * v.σ()[i] + factor[m.n + j] * dobs[i,j,0] * v.σ()[j]) * dobs[i,j,0] + (factor[i] - factor[j]) * dobs[i,j,1]  * dobs[i,j,1]
-                iflose = (factor[m.n +j] * v.σ()[j] + factor[m.n + i] * dobs[j,i,0] * v.σ()[j]) * dobs[j,i,0] + (factor[j] - factor[i]) * dobs[j,i,1]  * dobs[j,i,1]
-                p = v.prob_win(i, j)
+    plt.axis([-5, 5, -5, 5])
 
-                gain = p * ifwin * 0.5 + (1 - p) * iflose
-                if gain > 0:
-                    print(f"What's up, gain = {gain} > 0??")
-                if gain < best_gain:
-                    best_gain = gain
-                    best_pair = (i, j)
-        print(best_gain, best_pair, np.sum(v.σ()**2), (np.sum(v.σ()**2) - squares))
-        squares = np.sum(v.σ()**2)
-        if instance.match(best_pair[0], best_pair[1]):
-            obs[best_pair[0], best_pair[1]] += 1
+    for _ in range(2000):
+        (i,j) = v.best_pair(obs)
+        if instance.match(i,j):
+            obs[i,j] += 1
         else:
-            obs[best_pair[1], best_pair[0]] += 1
-
-
-    plt.errorbar(x=instance.z,y=v.μ(),yerr=1.96 * v.σ(),fmt='.')
+            obs[j,i] += 1
+        plt.clf()
+        plt.errorbar(x=instance.z,y=v.μ(),yerr=1.96 * v.σ(),fmt='.')
+        plt.pause(0.01)
 
     plt.show()
+
+test()
 
 
 

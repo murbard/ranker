@@ -21,10 +21,10 @@ def get_params():
         model = models.Model(4)
         instance = model.rvs()
         vbayes = models.VBayes(model)
-        vbayes.α *= (1 + np.random.randn() * 0.1)
-        vbayes.β *= (1 + np.random.randn() * 0.1)
-        vbayes.μ += np.random.randn() * (sqrt(instance.v) / 3)
-        vbayes.σ *= (1 + np.random.randn(model.n) * 0.1)
+        vbayes.α()[0] *= (1 + np.random.randn() * 0.1)
+        vbayes.β()[0] *= (1 + np.random.randn() * 0.1)
+        vbayes.μ()[:] += np.random.randn() * (sqrt(instance.v) / 3)
+        vbayes.σ()[:] *= (1 + np.random.randn(model.n) * 0.1)
 
         obs = instance.observe(3)
 
@@ -32,142 +32,123 @@ def get_params():
 
 params = list(get_params())
 
-class TestGradients(unittest.TestCase):
+
+
+
+
+class TestIntegral(unittest.TestCase):
+
+    def assertClose(self, a, b, tol=1e-2):
+        if a == 0 or b == 0:
+            self.assertAlmostEqual(a, b, delta=tol)
+        else:
+            self.assertLess( 2 * np.abs(a-b) / (np.abs(a) + np.abs(b)), tol)
 
     def setUp(self):
         np.random.seed(42)
 
+    @parameterized.expand(params)
+    def test_eval(self, name, vbayes, obs):
+        α, β = vbayes.α()[0], vbayes.β()[0]
+        µ, σ = vbayes.µ(), vbayes.σ()
+
+        minus_invgamma_entropy = lambda v, α, β:  invgamma(α, scale=1/β).pdf(v) * invgamma(α, scale=1/β).logpdf(v)
+        minus_normal_entropy = lambda x, µ, σ: norm(loc=µ, scale=σ).pdf(x) * norm(loc=µ, scale=σ).logpdf(x)
+        gamma_cross_entropy = lambda v, α, β: - invgamma(α, scale=1/β).pdf(v) * invgamma(vbayes.model.α, scale=1/vbayes.model.β).logpdf(v)
+        normal_cross_entropy = lambda α, β, μ, σ : 1/2 * (log(2 * π / β) + α * β * (μ**2 + σ**2) - polygamma(0, α))
+        observation = lambda δ, μδ, σδ: norm(loc=μδ, scale=σδ).pdf(δ) * (2 * exp(-π * δ**2 / 16) / π - (1/2) * δ * erfc(sqrt(π) * δ / 4))
+
+        integral = (
+              quad(minus_invgamma_entropy, 0, inf, args=(α, β))[0]
+            + sum([quad(minus_normal_entropy, -inf, inf, args=(µ[i], σ[i]))[0] for i in range(vbayes.n)])
+            + quad(gamma_cross_entropy, 0, inf, args=(α, β))[0]
+            + sum([normal_cross_entropy(α, β, µ[i], σ[i]) for i in range(vbayes.n)])
+            + sum([obs[i,j] * quad(observation, -inf, inf, args=(µ[i] - μ[j], sqrt(σ[i]**2 + σ[j]**2)))[0] for j in range(vbayes.n) for i in range(vbayes.n) if obs[i,j] != 0]))
+
+        self.assertAlmostEqual(integral, vbayes.eval(obs=obs).val, places=4)
 
     @parameterized.expand(params)
-    def test_gradient_invgamma_entropy(self, name, vbayes, obs):
-        α, β = vbayes.α, vbayes.β
-
-        g = vbayes.__gradient_invgamma_entropy__()
-
-        # Compute approximate gradients and assert that the relative error to the analytical gradient is small
-        ε = 1e-6
-        integrand = lambda α, β, v: - invgamma(α, scale=1/β).pdf(v) * invgamma(α, scale=1/β).logpdf(v)
-        Gα = quad(lambda v : (integrand(α + ε, β, v) - integrand(α - ε, β, v))/(2 * ε), 0, inf)[0]
-        self.assertLess(abs(Gα - g.α)/g.α, 1e-3)
-        Gβ = quad(lambda v : (integrand(α, β + ε, v) - integrand(α, β - ε, v))/(2 * ε), 0, inf)[0]
-        self.assertLess(abs(Gβ - g.β)/g.β, 1e-3)
-        # Test the integral itself
-        val = quad(lambda v : integrand(α,β,v), 0, inf)[0]
-        self.assertLess(abs(val - g.value)/g.value, 1e-3)
+    def test_gradients_hessian(self, name, vbayes, obs):
 
 
-    @parameterized.expand(params)
-    def test_gradient_normal_entropy(self, name, vbayes, obs):
-        µ, σ = vbayes.µ, vbayes.σ
+        funcs = [
+            lambda v, _, cg=False, ch=False : v.__minus_invgamma_entropy__(compute_gradient = cg, compute_hessian = ch),
+            lambda v, _, cg=False, ch=False : v.__minus_normal_entropy__(compute_gradient = cg, compute_hessian = ch),
+            lambda v, _, cg=False, ch=False : v.__gamma_cross_entropy__(compute_gradient = cg, compute_hessian = ch),
+            # lambda v, _, cg=False, ch=False : v.__normal_cross_entropy__(compute_gradient = cg, compute_hessian = ch),
+            lambda v, obs, cg=False, ch=False : v.__minus_observations__(compute_gradient = cg, compute_hessian = ch, obs=obs)
+        ]
 
-        g = vbayes.__gradient_normal_entropy__()
+        for func_name, func in zip([
+            'minus_invgamma_entropy',
+            'minus_normal_entropy',
+            'gamma_cross_entropy',
+            #'normal_cross_entropy'
+            'minus_observations' ], funcs):
+            gh = func(vbayes, obs, cg=True, ch=True)
+            val = gh.val
 
-        # Compute approximate gradients and assert that the relative error to the analytical gradient is small
-        ε = 1e-6
-        integrand = lambda μ, σ, x: - norm(loc=µ, scale=σ).pdf(x) * norm(loc=µ, scale=σ).logpdf(x)
-        val = 0
-        for i in range(vbayes.model.n):
-            Gμ = quad(lambda x : (integrand(µ[i] + ε, σ[i], x) - integrand(µ[i] - ε, σ[i], x))/(2 * ε), -inf, inf)[0]
-            self.assertLess(abs(Gμ), 1e-10) # both of these ought to be 0
-            self.assertLess(abs(g.μ[i]), 1e-10)
-            Gσ = quad(lambda x : (integrand(µ[i], σ[i] + ε, x) - integrand(µ[i], σ[i] - ε, x))/(2 * ε), -inf, inf)[0]
-            self.assertLess(abs(Gσ - g.σ[i])/g.σ[i], 1e-3)
-            val += quad(lambda x: integrand(μ[i],σ[i],x), -inf, inf)[0]
-        self.assertLess(abs(val - g.value)/g.value, 1e-3)
+            ε = 1e-4
 
-    @parameterized.expand(params)
-    def test_gradient_gamma_cross_entropy(self, name, vbayes, obs):
-        α, β = vbayes.α, vbayes.β
+            points = np.zeros((4,4))
+            ss = [-2,-1,1,2]
+            # test hessian and gradient
+            for k in range(vbayes.n):
 
-        g = vbayes.__gradient_gamma_cross_entropy__()
+                for u in range(2):
+                    vbayes.params[k] += (2*u - 1) * ε
+                    points[u,0] = func(vbayes, obs).val
+                    vbayes.params[k] -= (2*u - 1) * ε
+                    vbayes.params[k] += 2 * (2*u - 1) * ε
+                    points[u,1] = func(vbayes, obs).val
+                    vbayes.params[k] -= 2* (2*u - 1) * ε
 
-        ε = 1e-6
-        integrand = lambda α, β, v: - invgamma(α, scale=1/β).pdf(v) * invgamma(vbayes.model.α, scale=1/vbayes.model.β).logpdf(v)
-
-        Gα = quad(lambda v : (integrand(α + ε, β, v) - integrand(α - ε, β, v))/(2 * ε), 0, inf)[0]
-        self.assertLess((Gα - g.α) / abs(g.α), 1e-3)
-        Gβ = quad(lambda v : (integrand(α, β + ε, v) - integrand(α, β - ε, v))/(2 * ε), 0, inf)[0]
-        self.assertLess((Gβ - g.β) / abs(g.β), 1e-3)
-        # Test the integral itself
-        val = quad(lambda v: integrand(α,β,v), 0, inf)[0]
-        self.assertLess(abs(val - g.value)/g.value, 1e-3)
-
-    @parameterized.expand(params)
-    def test_gradient_normal_cross_entropy(self, name, vbayes, obs):
-        α, β = vbayes.α, vbayes.β
-        μ, σ = vbayes.μ, vbayes.σ
-
-        g = vbayes.__gradient_normal_cross_entropy__()
-
-        ε = 1e-6
-        # integrand = lambda α, β, μ, σ, v, z: -invgamma(α, scale=1/β).pdf(v) * norm(loc=μ, scale=σ).pdf(z) * norm(loc=0, scale=sqrt(v)).logpdf(z)
-        # dlbquad too slow, use the analytical solution
-
-        integral = lambda α, β, μ, σ : 1/2 * (log(2 * π / β) + α * β * (μ**2 + σ**2) - polygamma(0, α))
-
-        Gα, Gβ = 0, 0
-        for i in range(vbayes.n):
-
-            #Gα += dblquad(lambda v, z: (integrand(α + ε, β, μ[i], σ[i], v, z) - integrand(α - ε, β, μ[i], σ[i], v, z))/(2 * ε), -inf, inf, 0, inf)[0]
-            #Gβ += dblquad(lambda v, z: (integrand(α, β + ε, μ[i], σ[i], v, z) - integrand(α, β - ε, μ[i], σ[i], v, z))/(2 * ε), -inf, inf, 0, inf)[0]
-            #Gμ = dblquad(lambda v, z: (integrand(α, β, μ[i] + ε, σ[i], v, z) - integrand(α, β, μ[i] - ε, σ[i], v, z))/(2 * ε), -inf, inf, 0, inf)[0]
-            #Gσ = dblquad(lambda v, z: (integrand(α, β, μ[i], σ[i] + ε, v, z) - integrand(α, β, μ[i], σ[i] - ε, v, z))/(2 * ε), -inf, inf, 0, inf)[0]
-
-            Gα += (integral(α + ε, β, μ[i], σ[i]) - integral(α - ε, β, μ[i], σ[i]))/(2 * ε)
-            Gβ += (integral(α, β + ε, μ[i], σ[i]) - integral(α, β - ε, μ[i], σ[i]))/(2 * ε)
-            Gμ = (integral(α, β, μ[i] + ε, σ[i]) - integral(α, β, μ[i] - ε, σ[i]))/(2 * ε)
-            Gσ = (integral(α, β, μ[i], σ[i] + ε) - integral(α, β, μ[i], σ[i] - ε))/(2 * ε)
-
-            self.assertLess(abs(Gμ - g.μ[i])/g.μ[i], 1e-3)
-            self.assertLess(abs(Gσ - g.σ[i])/g.σ[i], 1e-3)
-        self.assertLess(abs(Gα - g.α)/g.α, 1e-3)
-        self.assertLess(abs(Gβ - g.β)/g.β, 1e-3)
-        # Test the integral itself
-        val = integral(α, β, μ, σ).sum()
-        self.assertLess(abs(val - g.value)/g.value, 1e-3)
+                g = (points[1,0] - points[0,0])/(2 * ε)
+                g_lo = (points[1,1] - points[0,1])/(4 * ε)
 
 
+                # g = true_g + c ε^3 + O(ε^4)
+                # g_lo = true_g + c (2 ε)^3 + O(ε^4)
+                # c ~ (g_lo - g) / (3 * ε^3)
+                # error of g ~ (g_lo - g) / (3)
 
+                error = max(2 * abs(g_lo - g) / 3, 1e-6)
+                g = (4 * g - g_lo) / 3
 
-    @parameterized.expand(list(get_params()))
-    def test_gradient_observations(self, name, vbayes, obs):
-        μ, σ = vbayes.μ, vbayes.σ
-        ε = 1e-6
+                try:
+                    self.assertAlmostEqual(g, gh.g[k], delta=error)
+                except AssertionError as e:
+                    print(f'gradient {func_name} {k} failed')
+                    raise e
 
-        g = vbayes.__gradient_observations__(obs)
-        Gμ, Gσ = np.zeros(vbayes.model.n), np.zeros(vbayes.model.n)
-        val = 0
-        for (i, j) in obs:
-            """ gradient of  Σ_ij  o[i,j] ∫ Normal(μi - μj, √(σi²+σj²), δ) log(1 + e^(-δ)) dδ """
-            σδ = sqrt(σ[i]**2 + σ[j]**2)
-            μδ = μ[i] - μ[j]
+                h = (points[1,0] - 2 * val + points[0,0])/(ε**2)
+                h_lo = (points[1,1] - 2 * val + points[0,1])/(4*ε**2)
 
-            # - ∫ Normal(μ, σ), δ) log(1 + e^(-δ)) ~ - ∫ Normal(μ, σ), δ) (2 e^(-π x²/16) / π - (1/2) x erfc(√(π) x / 4)) dδ
-            true_integrand = lambda μδ, σδ, δ: norm(loc=μδ, scale=σδ).pdf(δ) * log_expit(δ)
-            approx_integrand = lambda μδ, σδ, δ: - norm(loc=μδ, scale=σδ).pdf(δ) * (2 * exp(-π * δ**2 / 16) / π - (1/2) * δ * erfc(sqrt(π) * δ / 4))
+                error = max(2 * abs(h_lo - h) / 3, 1e-6)
+                h = (4 * h - h_lo) / 3
 
-            δμ = quad(lambda δ: (approx_integrand(μδ + ε, σδ, δ) - approx_integrand(μδ - ε, σδ, δ))/(2 * ε), -inf, inf)[0]
-            δσ = quad(lambda δ: (approx_integrand(μδ, σδ + ε, δ) - approx_integrand(μδ, σδ - ε, δ))/(2 * ε), -inf, inf)[0]
+                try:
+                    self.assertAlmostEqual(h, gh.h[k,k], delta=error)
+                except AssertionError:
+                    print(f'Failed for {name} on {func_name} for {k}')
+                    raise
 
-            Gμ[i] += δμ
-            Gμ[j] -= δμ
-            Gσ[i] += δσ * σ[i] / σδ
-            Gσ[j] += δσ * σ[j] / σδ
+                for l in range(k + 1, vbayes.n):
+                    for u in range(4):
+                        for v in range(4):
+                            vbayes.params[k] += ss[u] * ε
+                            vbayes.params[l] += ss[v] * ε
+                            points[u,v] = func(vbayes, obs).val
+                            vbayes.params[k] -= ss[u] * ε
+                            vbayes.params[l] -= ss[v] * ε
+                    h = (points[2,2] + points[1,1] - points[1,2] - points[2,1])/(4*ε**2)
+                    h_lo = (points[3,3] + points[0,0] - points[0,3] - points[3,0])/(16*ε**2)
 
-            val += quad(lambda δ: approx_integrand(μδ, σδ, δ), -inf, inf)[0]
-            # true_integral = quad(lambda δ: true_integrand(μδ, σδ, δ), -inf, inf)[0]
-            # self.assertLess(abs(approx_integral - true_integral)/true_integral, 1e-3) # dubious but we'll see
+                    error = max(2 * abs(h_lo - h) / 3, 1e-6)
+                    h = (4 * h - h_lo) / 3
 
-        for i in range(vbayes.model.n):
-            if abs(g.μ[i]) > 1e-12:
-                self.assertLess(abs(Gμ[i] - g.μ[i])/g.μ[i], 1e-3)
-            else:
-                self.assertLess(abs(Gμ[i]), 1e-6)
-
-            if abs(g.σ[i]) > 1e-12:
-                self.assertLess(abs(Gσ[i] - g.σ[i])/g.σ[i], 1e-3)
-            else:
-                self.assertLess(abs(Gσ[i]), 1e-6)
-
-        # Test the integral itself
-        self.assertLess(abs(val - g.value)/g.value, 1e-3)
+                    try:
+                        self.assertAlmostEqual(h, gh.h[k,l], delta=error)
+                    except AssertionError:
+                        print(f'Failed for {name} on {func_name} for {k} {l}')
+                        raise
