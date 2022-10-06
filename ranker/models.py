@@ -176,6 +176,10 @@ class VBayes():
         # √(b/a) (1 + 3 / (6 a + 2 a²))
         self.params[self.n : 2 * self.n] = ones(model.n) * sqrt(model.β  / model.α) * (1 + 3 / (6 * model.α + 2 * model.α**2))
 
+
+        # idea though: assume all variances are 0, take logits of obs, and do a least square fit on μ
+        # if obs is large this gives us a very good starting point for μ
+
         # Parameters of the distribution reprensting the posterior of model.v
         self.params[2 * self.n] = model.α
         self.params[2 * self.n + 1] = model.β
@@ -387,8 +391,13 @@ class VBayes():
         # ∫ - InvGamma(α, β, v) log( InvGamma(α', β', v)) dv
         self.__gamma_cross_entropy__(compute_gradient, compute_hessian, out=gh)
 
+<<<<<<< HEAD
         # ∫∫ - InvGamma(α, β, v) Normal(μ, σ, z) log(Normal(0, √v)) dv dz
         self.__normal_cross_entropy__(compute_gradient, compute_hessian, out=gh)
+=======
+        # ∫∫ - InvGamma(α, β, v) Normal(μ, σ, z) log(Normal(0, √v, z)) dv dz
+        gh += self.__gradient_normal_cross_entropy__()
+>>>>>>> 6adc224 (wibble)
 
         # Σ_ij  o[i,j] ∫ Normal(μi - μj, √(σi²+σj²), δ) log(1 + e^(-δ)) dδ
         self.__minus_observations__(obs, compute_gradient, compute_hessian, dobs=dobs, out=gh)
@@ -408,15 +417,40 @@ class VBayes():
             last_val = gh.val
 
 
+<<<<<<< HEAD
+=======
+
+            # check the condition number of gh.h
+
+
+            G = gh.g
+            H = gh.h
+
+            H[self.n:,self.n:] *= self.params[self.n:].reshape(-1,1).dot(self.params[self.n:].reshape(1,-1))
+            G[self.n:] *= self.params[self.n:]
+            H[self.n:,self.n:] += np.diag(G[self.n:])
+
+
+            # don't touch α and β
+            #gh.g = gh.g[:-2]
+            #gh.h = gh.h[:-2,:-2]
+
+>>>>>>> 6adc224 (wibble)
             # newton update for the log of positive parameters
             gh.h[self.n:,self.n:] *= self.params[self.n:].reshape(-1,1).dot(self.params[self.n:].reshape(1,-1))
             gh.g[self.n:] *= self.params[self.n:]
             gh.h[self.n:,self.n:] += np.diag(gh.g[self.n:])
 
+<<<<<<< HEAD
             λ = λ0
 
             if np.any(np.diag(gh.h) < 0):
                 raise "negative diagonal"
+=======
+            λ = 1e-8 # todo, when I increase lambda, don't reset it
+            # instead try to lower it until it keeps improving and stop
+            # if it's not improving, increase until it improves and stop
+>>>>>>> 6adc224 (wibble)
 
             while True:
                 try:
@@ -427,17 +461,27 @@ class VBayes():
                     factor = exp(-diff[self.n:])
                     self.params[self.n:] *= factor
 
+<<<<<<< HEAD
                     if self.eval(obs).val < gh.val: # if it's better stop
                         if verbose and λ > λ0:
                             print(f"λ = {λ}")
+=======
+                    if self.gradient(obs).val < gh.val: # if it's better stop
+                        if verbose and λ > 1e-8:
+                            print("had to set λ to", λ)
+>>>>>>> 6adc224 (wibble)
                         break
 
                     else:
                         self.params = old_params
                         λ *= 10 # otherwise increase the conditioning
+                        #if verbose:
+                        #    print(f"λ->{λ} because overshoot")
 
                 except RuntimeWarning as r:
                     λ *= 10
+                    #if verbose:
+                    #    print(f"λ->{λ} because warning")
 
             if verbose:
                 print(gh.val, (self.σ()**2).mean() ) # , "KL~", self.KL(obs))
@@ -478,15 +522,34 @@ class VBayes():
 
 
 def test():
+<<<<<<< HEAD
     m = Model(n=10)
     v = VBayes(m)
 
     instance = m.rvs()
     obs = instance.observe(400)
+=======
+    m = Model(n=100)
+    v = VBayes(m)
+
+    instance = m.rvs()
+    obs = instance.observe(round(2 * m.n * m.n))
+    print(v)
+>>>>>>> 6adc224 (wibble)
 
     squares =  np.sum(v.σ()**2)
     for _ in range(200):
 
+<<<<<<< HEAD
+=======
+    v.fit(obs, verbose=True)
+    print(v, instance)
+    plt.scatter(v.μ(), instance.z)
+    plt.show()
+
+    for _ in range(100):
+        # fit
+>>>>>>> 6adc224 (wibble)
         v.fit(obs, verbose=False)
         dobs = np.zeros((m.n, m.n, 2))
         gh = v.eval(obs,compute_gradient=True,compute_hessian=True, dobs=dobs)
