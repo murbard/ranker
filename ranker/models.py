@@ -25,7 +25,7 @@ def almost_log_expit(x):
 
 class Model():
 
-    def __init__(self, n, α=1.2, β=0.5):
+    def __init__(self, n, α=1.2, β=2.0):
         self.n = n
         self.α = α
         self.β = β
@@ -593,11 +593,11 @@ class VBayes():
 
 
 def test():
-    m = Model(n=10)
+    m = Model(n=50)
     v = VBayes(m)
 
     instance = m.rvs()
-    obs = instance.observe(20)
+    obs = instance.observe(50)
 
 
     plt.axis([-5, 5, -5, 5])
