@@ -1,3 +1,4 @@
+from operator import pos
 from scipy.stats import invgamma, norm
 from scipy.special import gammaln, gamma, polygamma, erf, erfc, expit
 from scipy.integrate import quad
@@ -527,7 +528,7 @@ class VBayes():
         return inversions
 
 
-    def best_pair(self, obs, target='expected_inversions'):
+    def best_pair(self, obs, target='expected_inversions', verify_top=0, possible_pairs=None):
 
         self.fit(verbose=False, obs=obs, tol=1e-12)
         dobs = np.zeros((self.n, self.n, 2))
@@ -545,25 +546,47 @@ class VBayes():
 
         factor = -linalg.solve(gh.h, df_dparam, assume_a='sym')
 
-        best_gain, best_ifwin, best_iflose = 0.0, 0.0, 0.0
-        best_pair = None
-        for i in range(self.n):
-            for j in range(i + 1 , self.n):
-                ifwin  = (factor[self.n + i] * self.σ()[i] + factor[self.n + j] * self.σ()[j]) * dobs[i,j,0] + (factor[i] - factor[j]) * dobs[i,j,1]
-                iflose = (factor[self.n + j] * self.σ()[j] + factor[self.n + i] * self.σ()[i]) * dobs[j,i,0] + (factor[j] - factor[i]) * dobs[j,i,1]
-                p = self.prob_win(i, j)
+        gains = []
+        if possible_pairs is None:
+            possible_pairs = [(i, j) for i in range(self.n) for j in range(i+1, self.n)]
 
-                gain = p * ifwin + (1 - p) * iflose
-                if gain > 0:
-                    pass
-                    # print(f"What's up, gain = {gain} > 0??")
-                if gain < best_gain:
-                    best_gain = gain
-                    best_ifwin = ifwin
-                    best_iflose = iflose
-                    best_pair = (i, j)
+        for i,j in possible_pairs:
+            ifwin  = (factor[self.n + i] * self.σ()[i] + factor[self.n + j] * self.σ()[j]) * dobs[i,j,0] + (factor[i] - factor[j]) * dobs[i,j,1]
+            iflose = (factor[self.n + j] * self.σ()[j] + factor[self.n + i] * self.σ()[i]) * dobs[j,i,0] + (factor[j] - factor[i]) * dobs[j,i,1]
+            p = self.prob_win(i, j)
 
-        return best_pair
+            gain = p * ifwin + (1 - p) * iflose
+            gains.append(np.array([gain, i, j]))
+
+        gains = np.array(gains)
+        gains = gains[np.lexsort(gains.T[::-1])]
+
+        einv = self.expected_inversions()
+        real_gains = np.zeros(gains.shape)
+        k = 0
+        for i, j in possible_pairs:
+            # i, j = round(gains[k,1]), round(gains[k,2])
+            old_params = self.params.copy()
+            obs[i, j] += 1
+            self.fit(verbose=False, obs=obs, tol=1e-12)
+            win = self.expected_inversions()
+            obs[i, j] -= 1
+            self.params = old_params.copy()
+            obs[j, i] += 1
+            self.fit(verbose=False, obs=obs, tol=1e-12)
+            lose = self.expected_inversions()
+            obs[j, i] -= 1
+            self.params = old_params.copy()
+            p = self.prob_win(i, j)
+            real_gains[k,0] = p * win + (1 - p) * lose - einv
+            real_gains[k,1] = i
+            real_gains[k,2] = j
+            k = k + 1
+
+        gains = gains[np.lexsort(gains.T[::-1])]
+
+
+        return gains
 
 
 
@@ -574,13 +597,14 @@ def test():
     v = VBayes(m)
 
     instance = m.rvs()
-    obs = instance.observe(0)
+    obs = instance.observe(20)
 
 
     plt.axis([-5, 5, -5, 5])
 
     for _ in range(2000):
-        (i,j) = v.best_pair(obs)
+        (i,j) = v.best_pair(obs, verify_top=10)
+        print(i,j, v.expected_inversions(), v.actual_inversions(instance))
         if instance.match(i,j):
             obs[i,j] += 1
         else:
