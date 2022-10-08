@@ -19,6 +19,7 @@ except ImportError:
     def log_expit(x):
         return  -log(1 + exp(-np.abs(x))) + min(x, 0)
 
+κstats = []
 
 def almost_log_expit(x):
     return - 2 * exp(- π * x**2 / 16) / π + x / 2 * erfc(sqrt(π) * x / 4)
@@ -82,16 +83,14 @@ class Instance():
 
     def observe(self, n_obs):
         obs = np.zeros((self.n, self.n))
-        for _ in range(n_obs):
-            i = np.random.randint(self.n)
-            while True:
-                j = np.random.randint(self.n)
-                if i != j:
-                    break
-            if np.random.rand() < expit(self.z[i] - self.z[j]):
-                obs[i,j] += 1
-            else:
-                obs[j, i] += 1
+        ps = np.empty(self.n * self.n)
+        ps.fill(1.0 / (self.n * self.n))
+        counts = np.random.multinomial(n_obs, ps)
+        for i in range(self.n):
+            for j in range(self.n):
+                p = expit(self.z[i] - self.z[j])
+                obs[i, j] = np.random.binomial(counts[i * self.n + j], p)
+                obs[j, i] = counts[i * self.n + j] - obs[i, j]
         return obs
 
     def match(self, i, j):
@@ -405,7 +404,26 @@ class VBayes():
             raise ValueError("NaN in hessian")
         return gh
 
-    def fit(self, obs, niter=100000, tol=1e-8, verbose=True, λ0 = 1e-4):
+
+    def fit_lbfgs(self, obs, maxiter = 1000, maxfun = 1000, maxcor = 10, ftol = 1e-8, gtol = 1e-12, disp = False, callback = None):
+        # Fit the parameters using the L-BFGS algorithm
+
+
+
+        def f(x):
+            self.params = x
+            gh = self.eval(obs, compute_gradient = True, compute_hessian = False)
+            return gh.val, gh.g
+
+        x0 = self.params.copy()
+        res = minimize(f, x0, method='L-BFGS-B',
+        bounds=[(-inf, inf)] * self.n + [(1e-6, inf)] * (self.n + 2),
+         jac=True, hess=False, options={'maxiter': maxiter, 'maxfun': maxfun, 'maxcor': maxcor, 'ftol': ftol, 'gtol': gtol, 'disp': disp, 'callback': callback})
+        self.params = res.x
+
+    def fit(self, obs, niter=100000, tol=1e-8, verbose=True, λ0 = 1e-10):
+
+        global κstats
         last_val = None
         for _ in range(niter):
             λ = λ0
@@ -421,13 +439,19 @@ class VBayes():
             gh.h[self.n:,self.n:] += np.diag(gh.g[self.n:])
 
 
-
             if np.any(np.diag(gh.h) < 0):
                 raise "negative diagonal"
 
+            # condition by the diagonal
+            sd = 1 / sqrt(np.diag(gh.h))
+            gh.h *= np.outer(sd,sd)
+            gh.g *= sd
+
             while True:
                 try:
-                    diff =  linalg.solve(gh.h + np.diag(np.diag(gh.h) * (1 + λ)), gh.g, assume_a='sym')
+                    # κ = np.linalg.cond(gh.h + np.diag(np.diag(gh.h) * (1 + λ)))
+                    # κstats.append(κ)
+                    diff =  sd * linalg.solve(gh.h + np.diag(np.diag(gh.h) * (1 + λ)), gh.g, assume_a='sym')
 
                     old_params = self.params.copy()
                     self.params[:self.n] -= diff[:self.n]
@@ -452,6 +476,22 @@ class VBayes():
 
             if verbose:
                 print(gh.val, (self.σ()**2).mean() ) # , "KL~", self.KL(obs))
+
+        # print some stats regarding κ, such as mean, standard deviation, and various percentiles
+        # κstats = np.array(κstats)
+        # print("κ stats:")
+        # print("mean:", κstats.mean())
+        # print("std:", κstats.std())
+        # print("min:", κstats.min())
+        # print("max:", κstats.max())
+        # print("25%:", np.percentile(κstats, 25))
+        # print("50%:", np.percentile(κstats, 50))
+        # print("75%:", np.percentile(κstats, 75))
+        # print("90%:", np.percentile(κstats, 90))
+        # print("95%:", np.percentile(κstats, 95))
+        # print("99%:", np.percentile(κstats, 99))
+        # print("99.9%:", np.percentile(κstats, 99.9))
+        return
 
 
     def prob_win(self, i, j):
@@ -530,7 +570,7 @@ class VBayes():
 
     def best_pair(self, obs, target='expected_inversions', verify_top=0, possible_pairs=None):
 
-        self.fit(verbose=False, obs=obs, tol=1e-12)
+        self.fit(verbose=False, obs=obs)
         dobs = np.zeros((self.n, self.n, 2))
         gh = self.eval(obs,compute_gradient=True,compute_hessian=True, dobs=dobs)
 
@@ -565,15 +605,16 @@ class VBayes():
         real_gains = np.zeros(gains.shape)
         k = 0
         for i, j in possible_pairs:
+            print(k/len(possible_pairs))
             # i, j = round(gains[k,1]), round(gains[k,2])
             old_params = self.params.copy()
             obs[i, j] += 1
-            self.fit(verbose=False, obs=obs, tol=1e-12)
+            self.fit(verbose=False, obs=obs, tol=1e-6)
             win = self.expected_inversions()
             obs[i, j] -= 1
             self.params = old_params.copy()
             obs[j, i] += 1
-            self.fit(verbose=False, obs=obs, tol=1e-12)
+            self.fit(verbose=False, obs=obs, tol=1e-6)
             lose = self.expected_inversions()
             obs[j, i] -= 1
             self.params = old_params.copy()
@@ -597,7 +638,8 @@ def test():
     v = VBayes(m)
 
     instance = m.rvs()
-    obs = instance.observe(50)
+    obs = instance.observe(50*50*1000)
+
 
 
     plt.axis([-5, 5, -5, 5])
@@ -621,6 +663,7 @@ test()
 
 
 if __name__ == '__main__':
+    κstats = []
     # lp = LineProfiler()
     # lp.add_function(VBayes.eval)
     # lp.add_function(VBayes.fit)

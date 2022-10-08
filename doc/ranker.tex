@@ -20,8 +20,8 @@ sorting=ynt
     Ranker is a Bayesian algorithm for ranking items in a set, inspired by the ELO rating
     system in chess. It assumes each item has a latent score, normally distributed
     with a latent variance, and that the outcome of a pairwise comparison is a Bernoulli
-    trial with a probability of success given by the logistic function of the difference.   
-    
+    trial with a probability of success given by the logistic function of the difference.
+
     Ranker infers the latent scores of the items and the variance using a variational
     Bayes approximation which models the posterior as an inverse gamma distributed variance
     and independent normally distributed scores. We compute the KL-divergence gradient and
@@ -29,7 +29,7 @@ sorting=ynt
     This yields a very fast inference technique, based on the Levenberg-Marquardt algorithm.
 
     Ranker can do more than infer scores and rank items, it can also be used to select the
-    most useful pair of items to compare next. We do this efficiently by computing the 
+    most useful pair of items to compare next. We do this efficiently by computing the
     gradient of our loss function with respect to the observed trials. The entire algorithm
     runs in $\mathcal{O}(n^2)$ time, where $n$ is the number of items.
 \end{abstract}
@@ -38,8 +38,8 @@ sorting=ynt
     Ranker is a Bayesian algorithm for ranking items in a set, inspired by the ELO rating
     system in chess. It assumes each item has a latent score, normally distributed
     with a latent variance, and that the outcome of a pairwise comparison is a Bernoulli
-    trial with a probability of success given by the logistic function of the difference.   
-    
+    trial with a probability of success given by the logistic function of the difference.
+
     Ranker infers the latent scores of the items and the variance using a variational
     Bayes approximation which models the posterior as an inverse gamma distributed variance
     and independent normally distributed scores. We compute the KL-divergence gradient and
@@ -47,7 +47,7 @@ sorting=ynt
     This yields a very fast inference technique, based on the Levenberg-Marquardt algorithm.
 
     Ranker can do more than infer scores and rank items, it can also be used to select the
-    most useful pair of items to compare next. We do this efficiently by computing the 
+    most useful pair of items to compare next. We do this efficiently by computing the
     gradient of our loss function with respect to the observed trials. The entire algorithm
     runs in $\mathcal{O}(n^2)$ time, where $n$ is the number of items.
 
@@ -73,7 +73,7 @@ sorting=ynt
     in the learning rate is a two-edged sword: it allows the ratings to change quickly, reflecting
     a player's recent performance, but it also means that the ratings can change wildly. For that
     reason, $K$ is typically set at $16$ for masters and $32$ for grandmasters.
-    
+
     A partial Bayesian approach to the ELO rating system is described in BayesElo, using
     Maximum a Posteriori (MAP) estimation, following the work of \cite{10.1214/aos/1079120141}.
 
@@ -95,7 +95,7 @@ sorting=ynt
     a rate, not a scale. The scale is $1 / \beta_h$.
 
     \subsubsection{Choice of hyperparameters}
-    We pick concrete values for the hyperparameters $\alpha_h = 1.2$ and $\beta_h = 2$    
+    We pick concrete values for the hyperparameters $\alpha_h = 1.2$ and $\beta_h = 2$
     A handwavy justification for these values follows.
 
     Consider the binomial distribution over 10 stars, obtained by flipping a coin
@@ -103,7 +103,7 @@ sorting=ynt
     $\sqrt{5/2} \simeq 1.5811$. The difference between two adjacent start ratings is thus
     $\sqrt{2/5} \simeq 0.6325$. Based on this intuition, we call a difference of $\sqrt{2/5}$ standard deviations
     a "star" of difference.
-    
+
     Assuming this is an intuitive notion of a "star", what odds
     should an additional star confer to an item in a heads up match?
     If those comparisons are hard to judge and very subjective, maybe only 55\% of the time?
@@ -134,11 +134,11 @@ We approximate the posterior with a factorized distribution.
     \end{aligned}
 \end{equation}
 
-Note that $\alpha$ and $\beta$ are parameters of the approximation to the posterior, not the hyperparameters of the model, which are 
+Note that $\alpha$ and $\beta$ are parameters of the approximation to the posterior, not the hyperparameters of the model, which are
 $\alpha_h$ and $\beta_h$. Nonetheless, we naturally initialize $\alpha$ and $\beta$ to $\alpha_h$ and $\beta_h$. We initialize $\mu_i$ to $0$.
 The case of $\sigma_i$ is more complicated. Absent any observation, the distribution of $z_i$ is a Student's distribution with
 infinite variance. We choose to initialize $\sigma_i$ to minimize the KL divergence with that Student distribution. We discovered
-empirically (but did not attempt to prove) that the minimum is reached for 
+empirically (but did not attempt to prove) that the minimum is reached for
 $$\sigma_i = 1 + \frac{3}{6 \alpha_h + 2 \alpha_h^2 + \mathcal{O}(\alpha_h^3)}$$
 
 
@@ -150,10 +150,10 @@ The KL divergence between the true posterior, $P$, and the variational approxima
 where $H(Q)$ is the entropy of $Q$ and $H(Q,P)$ is the cross entropy of $Q$ and $P$. The entropy of $Q$ is
 
 \begin{multline*}
-    H(Q) = \int_{\nu=0}^{\infty} \frac{\beta^{-\alpha}\nu^{-\alpha-1}e^{-\frac{1}{\beta \nu}}}{\Gamma(\alpha) } 
+    H(Q) = \int_{\nu=0}^{\infty} \frac{\beta^{-\alpha}\nu^{-\alpha-1}e^{-\frac{1}{\beta \nu}}}{\Gamma(\alpha) }
     \left(\alpha_h \log(\beta_h) + (\alpha+1)\log(\nu) + \frac{1}{\beta \nu} + \log(\Gamma(\alpha))\right)
     d\nu \\
-    + \sum_{i=1}^n \int_{z_i=-\infty}^{\infty} \frac{e^{-\frac{1}{2}\left(\frac{z_i-\mu_i}{\sigma_i}\right)^2}}{\sigma_i \sqrt{2 \pi}} 
+    + \sum_{i=1}^n \int_{z_i=-\infty}^{\infty} \frac{e^{-\frac{1}{2}\left(\frac{z_i-\mu_i}{\sigma_i}\right)^2}}{\sigma_i \sqrt{2 \pi}}
     \left(\frac{1}{2} \log{2\pi} + \log{\sigma_i} + \frac{1}{2}\left(\frac{z_i-\mu_i}{\sigma_i}\right)^2\right) dz_i
 \end{multline*}
 
@@ -161,14 +161,14 @@ where $H(Q)$ is the entropy of $Q$ and $H(Q,P)$ is the cross entropy of $Q$ and 
 The cross entropy of $Q$ and $P$ is
 
 \begin{multline*}
-    H(Q,P) = \int_{\nu=0}^{\infty} \frac{\beta^{-\alpha}\nu^{-\alpha-1}e^{-\frac{1}{\beta \nu}}}{\Gamma(\alpha)} 
+    H(Q,P) = \int_{\nu=0}^{\infty} \frac{\beta^{-\alpha}\nu^{-\alpha-1}e^{-\frac{1}{\beta \nu}}}{\Gamma(\alpha)}
 \left(\alpha_h \log(\beta_h) + (\alpha+1)\log(\nu) + \frac{1}{\beta \nu} + \log(\Gamma(\alpha))\right)
 \\
 + \sum_{i=1}^n \int_{\nu=0}^{\infty} \int_{z_i=-\infty}^{\infty} \frac{e^{-\frac{1}{2}\left(\frac{z_i-\mu_i}{\sigma_i}\right)^2}}{\sigma_i \sqrt{2 \pi}} \left(
-\frac{1}{2} \log{2\pi} + \log(\nu) + \frac{1}{2}\frac{z_i^2}{\nu} 
+\frac{1}{2} \log{2\pi} + \log(\nu) + \frac{1}{2}\frac{z_i^2}{\nu}
 \right)dz_i d\nu\\
 + \sum_{i=1}^n\sum_{j=1}^n m_{i,j} \int_{z_\delta=-\infty}^{\infty}
-\frac{e^{-\frac{1}{2}\left(\frac{z_\delta - (\mu_i - \mu_j)}{\sqrt{\sigma_i^2 + \sigma_j^2}}\right)^2}}{\sqrt{\sigma_i^2 + \sigma_j^2} \sqrt{2 \pi}} \log\left(1 + e^{-z_\delta}\right) z_\delta + 
+\frac{e^{-\frac{1}{2}\left(\frac{z_\delta - (\mu_i - \mu_j)}{\sqrt{\sigma_i^2 + \sigma_j^2}}\right)^2}}{\sqrt{\sigma_i^2 + \sigma_j^2} \sqrt{2 \pi}} \log\left(1 + e^{-z_\delta}\right) z_\delta +
 Cst
 \end{multline*}
 
@@ -176,7 +176,7 @@ Cst
 \subsection{The logistic-normal integral}
 
 As it turns out, we can express most of the integrals above in terms of elementary functions, as well as the polygamma function $\Psi$.
-The integral 
+The integral
 
 $$\int_{z_\delta=-\infty}^{\infty}
 \frac{e^{-\frac{1}{2}\left(\frac{z_\delta - (\mu_i - \mu_j)}{\sqrt{\sigma_i^2 + \sigma_j^2}}\right)^2}}{\sqrt{\sigma_i^2 + \sigma_j^2} \sqrt{2 \pi}} \log\left(1 + e^{-z_\delta}\right) dz_\delta$$
@@ -191,12 +191,12 @@ $$\int_{z_\delta=-\infty}^{\infty}
 $$\frac{1}{1+e^{-z}} \simeq \frac{1}{2} + \frac{1}{2} \text{erf}\left(\frac{\sqrt{\pi}}{4} z\right)$$
 
 Given that $\frac{d}{d z}\log\left(1 + e^{-z}\right) = 1 - \frac{1}{1 + e^{-z}}$ we choose to approximate $\log\left(1 + e^{-z}\right)$
-as 
+as
 
-$$\log\left(1 + e^{-z}\right) \simeq \int_{\zeta=0}^{z} \left(\frac{1}{2} - \frac{1}{2} \text{erf}\left(\frac{\sqrt{\pi}}{4} z\right)\right) d\zeta = 
-\frac{2}{\pi}\left(1-e^{-\frac{\pi z^2}{16}}\right) + \frac{1}{2} z~\mathrm{erfc}\left(\frac{\sqrt{\pi}}{4} z\right)$$
+$$\log\left(1 + e^{-z}\right) \simeq \int_{\zeta=z}^{\infty} \left(\frac{1}{2} - \frac{1}{2} \text{erf}\left(\frac{\sqrt{\pi}}{4} \zeta \right)\right)~d\zeta =
+\frac{2}{\pi}e^{-\frac{\pi z^2}{16}} - \frac{1}{2} z~\mathrm{erfc}\left(\frac{\sqrt{\pi}}{4} z\right)$$
 
-
+The difference between the two is maximal for $z = 0$ and is $\log(2) - \frac{2}{\pi} \simeq 0.0565$. The difference between the derivatives with respect to $z$ is at most $0.0177$.
 
 
 
@@ -214,8 +214,3 @@ $$\log\left(1 + e^{-z}\right) \simeq \int_{\zeta=0}^{z} \left(\frac{1}{2} - \fra
 \printbibliography
 
 \end{document}
-
-
-
-
-
