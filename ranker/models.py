@@ -2,6 +2,7 @@ from operator import pos
 from scipy.stats import invgamma, norm
 from scipy.special import gammaln, gamma, polygamma, erf, erfc, expit
 from scipy.integrate import quad
+from scipy.sparse import coo_matrix
 from numpy import log, sqrt, exp, linspace, array, zeros, ones, arange, pi as π, inf, sign
 import numpy as np
 import copy
@@ -23,6 +24,12 @@ except ImportError:
 
 def almost_log_expit(x):
     return - 2 * exp(- π * x**2 / 16) / π + x / 2 * erfc(sqrt(π) * x / 4)
+
+
+# TODO:
+# Use a sparse Matrix to represent the Hessian
+# use scipy sparse cg to solve the linear system, scipy.sparse.linalg.cg
+# set up a benchmark to compare my homebrew solution vs directly using scipy.minimize
 
 class Model():
 
@@ -103,19 +110,36 @@ class GradientHessian():
         self.val = 0
         self.n = n
         self.g = zeros(2*n+2)
-        self.h = zeros((2*n+2, 2*n+2))
-        # format: μ, σ, α, β
+        #self.h = zeros((2*n+2, 2*n+2))
+        # use sparse matrix instead
+        self.h = linalg.LinearOperator((2*n+2, 2*n+2), matvec=self.matvec)
+
+        self.h_diag = zeros(2*n+2)
+        self.h_αβ = zeros(2,2)
+        self.h_μσαβ = zeros(2*n,2*n)
+        self.h_obs = coo_matrix((2*n, 2*n))
+
+    def matvec(self, x):
+        res =  self.h_diag * x
+        res[-2:] += (self.h_αβ + self.h_αβ.T).dot(x[:-2])
+        res[:-2] += self.h_μσαβ.dot(x[-2:])
+        res[-2:] += self.h_μσαβ.T.dot(x[:-2])
+        res[:-2] += self.h_obs.dot(x)
+        return res
+
 
     def __add__(self, other):
         self.val += other.val
         self.g += other.g
-        self.h += other.h
+        self.h_diag += other.h_diag
+        self.h_nodiag += other.h_nodiag
         return self
 
     def __sub__(self, other):
         self.val -= other.val
         self.g -= other.g
-        self.h -= other.h
+        self.h_diag -= other.h_diag
+        self.h_nodiag -= other.h_nodiag
         return self
 
     def gα(self):
@@ -130,35 +154,35 @@ class GradientHessian():
     def gσ(self):
         return self.g[self.n:2*self.n]
 
-    def hαα(self):
-        return self.h[2 * self.n : 2 * self.n + 1, 2 * self.n : 2 * self.n + 1]
+    # def hαα(self):
+    #     return self.h[2 * self.n : 2 * self.n + 1, 2 * self.n : 2 * self.n + 1]
 
-    def hαβ(self):
-        return self.h[2 * self.n : 2 * self.n + 1, 2 * self.n + 1 : 2 * self.n + 2]
+    # def hαβ(self):
+    #     return self.h[2 * self.n : 2 * self.n + 1, 2 * self.n + 1 : 2 * self.n + 2]
 
-    def hββ(self):
-        return self.h[2 * self.n + 1 : 2 * self.n + 2, 2 * self.n + 1 : 2 * self.n + 2]
+    # def hββ(self):
+    #     return self.h[2 * self.n + 1 : 2 * self.n + 2, 2 * self.n + 1 : 2 * self.n + 2]
 
-    def hμμ(self):
-        return self.h[:self.n, :self.n]
+    # def hμμ(self):
+    #     return self.h[:self.n, :self.n]
 
-    def hμσ(self):
-        return self.h[:self.n, self.n:2*self.n]
+    # def hμσ(self):
+    #     return self.h[:self.n, self.n:2*self.n]
 
-    def hσσ(self):
-        return self.h[self.n:2*self.n, self.n:2*self.n]
+    # def hσσ(self):
+    #     return self.h[self.n:2*self.n, self.n:2*self.n]
 
-    def hμα(self):
-        return self.h[:self.n, 2*self.n : 2*self.n + 1]
+    # def hμα(self):
+    #     return self.h[:self.n, 2*self.n : 2*self.n + 1]
 
-    def hσα(self):
-        return self.h[self.n:2*self.n, 2*self.n : 2*self.n + 1]
+    # def hσα(self):
+    #     return self.h[self.n:2*self.n, 2*self.n : 2*self.n + 1]
 
-    def hμβ(self):
-        return self.h[:self.n, 2*self.n+1 : 2*self.n + 2]
+    # def hμβ(self):
+    #     return self.h[:self.n, 2*self.n+1 : 2*self.n + 2]
 
-    def hσβ(self):
-        return self.h[self.n:2*self.n, 2*self.n+1 : 2*self.n + 2]
+    # def hσβ(self):
+    #     return self.h[self.n:2*self.n, 2*self.n+1 : 2*self.n + 2]
 
 
 
@@ -221,8 +245,10 @@ class VBayes():
             gh.gβ()[0] += 1 / β
 
         if compute_hessian:
-            gh.hαα()[0] += polygamma(1, α) + ((1 + α) * polygamma(2, α))
-            gh.hββ()[0] += - 1 / β**2
+            gh.h_diag[2*self.n] += (1 + α) * polygamma(2, α)
+            gh.h_diag[2*self.n+1] += -1 / β**2
+            # gh.hαα()[0] += polygamma(1, α) + ((1 + α) * polygamma(2, α))
+            # gh.hββ()[0] += - 1 / β**2
 
         return gh
 
@@ -236,7 +262,8 @@ class VBayes():
         if compute_gradient:
             gh.gσ()[:] += - 1 / σ # we subtract the entropy gradient, so when we minimize this pushes σ to be bigger
         if compute_hessian:
-            gh.hσσ()[:] += np.diag(1 / σ**2)
+            # gh.hσσ()[:] += np.diag(1 / σ**2)
+            gh.h_diag[self.n:2*self.n] += 1 / σ**2
 
         return gh
 
@@ -255,9 +282,12 @@ class VBayes():
             gh.gβ()[0] += α / self.model.β - (1 + self.model.α) / β
 
         if compute_hessian:
-            gh.hαα()[0] += -(1 + self.model.α) * polygamma(2, α)
-            gh.hββ()[0] += (1 + self.model.α) / β**2
-            gh.hαβ()[0] += 1 / self.model.β
+            # gh.hαα()[0] += -(1 + self.model.α) * polygamma(2, α)
+            # gh.hββ()[0] += (1 + self.model.α) / β**2
+            # gh.hαβ()[0] += 1 / self.model.β
+            gh.h_diag[2*self.n] += -(1 + self.model.α) * polygamma(2, α)
+            gh.h_diag[2*self.n+1] += (1 + self.model.α) / β**2
+            gh.h_nodiag[2*self.n, 2*self.n+1] += 1 / self.model.β
 
         return gh
 
@@ -278,15 +308,26 @@ class VBayes():
             gh.gβ()[0] += 1/2 * (α * (μ**2 + σ**2).sum() - n / β)
 
         if compute_hessian:
-            gh.hαα()[0] += - 1 / 2 * n * polygamma(2, α)
-            gh.hαβ()[0] += 1/2 * (μ**2 + σ**2).sum()
-            gh.hββ()[0] += n / (2 * β**2)
-            gh.hμα()[:,0] += β * μ
-            gh.hμβ()[:,0] += α * μ
-            gh.hσα()[:,0] += β * σ
-            gh.hσβ()[:,0] += α * σ
-            gh.hμμ()[:] += α * β * np.eye(n)
-            gh.hσσ()[:] += α * β * np.eye(n)
+            # gh.hαα()[0] += - 1 / 2 * n * polygamma(2, α)
+            # gh.hαβ()[0] += 1/2 * (μ**2 + σ**2).sum()
+            # gh.hββ()[0] += n / (2 * β**2)
+
+            gh.h_diag[2*self.n] += - 1 / 2 * n * polygamma(2, α)
+            gh.h_nodiag[2*self.n, 2*self.n+1] += 1/2 * (μ**2 + σ**2).sum()
+            gh.h_diag[2*self.n+1] += n / (2 * β**2)
+
+            # gh.hμα()[:,0] += β * μ
+            # gh.hμβ()[:,0] += α * μ
+            # gh.hσα()[:,0] += β * σ
+            # gh.hσβ()[:,0] += α * σ
+            # gh.hμμ()[:] += α * β * np.eye(n)
+            # gh.hσσ()[:] += α * β * np.eye(n)
+
+            gh.h_nodiag[:self.n, 2*self.n] += β * μ
+            gh.h_nodiag[:self.n, 2*self.n+1] += α * μ
+            gh.h_nodiag[self.n:2*self.n, 2*self.n] += β * σ
+            gh.h_nodiag[self.n:2*self.n, 2*self.n+1] += α * σ
+            gh.h_diag[:2*self.n] += α * β
 
         return gh
 
@@ -358,18 +399,31 @@ class VBayes():
                         hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3)
                         hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + μδ**2)) / (π**(5/2) * h**5)
 
-                        gh.hμμ()[i,i] -= count * hμμδ
-                        gh.hμμ()[j,j] -= count * hμμδ
-                        gh.hμμ()[min(i,j), max(i,j)] -= count * (-hμμδ)
+                        #gh.hμμ()[i,i] -= count * hμμδ
+                        #gh.hμμ()[j,j] -= count * hμμδ
+                        #gh.hμμ()[min(i,j), max(i,j)] -= count * (-hμμδ)
 
-                        gh.hσσ()[i,i] -= count * (hσσδ * (σ[i]/σδ)**2 + gσδ * σ[j]**2/σδ**3)
-                        gh.hσσ()[min(i,j), max(i,j)] -= count * (hσσδ * (σ[i]*σ[j] / σδ**2) - gσδ * σ[i]*σ[j] / σδ**3)
-                        gh.hσσ()[j,j] -= count * (hσσδ * (σ[j]/σδ)**2 + gσδ * σ[i]**2/σδ**3)
+                        gh.h_diag[i] -= count * hμμδ
+                        gh.h_diag[j] -= count * hμμδ
+                        gh.h_nodiag[min(i,j), max(i,j)] -= count * (-hμμδ)
 
-                        gh.hμσ()[i,i] -= count * hμσδ * σ[i] / σδ
-                        gh.hμσ()[i,j] -= count * hμσδ * σ[j] / σδ
-                        gh.hμσ()[j,i] -= count *  (-hμσδ * σ[i] / σδ)
-                        gh.hμσ()[j,j] -= count *  (-hμσδ * σ[j] / σδ)
+                        # gh.hσσ()[i,i] -= count * (hσσδ * (σ[i]/σδ)**2 + gσδ * σ[j]**2/σδ**3)
+                        # gh.hσσ()[j,j] -= count * (hσσδ * (σ[j]/σδ)**2 + gσδ * σ[i]**2/σδ**3)
+                        # gh.hσσ()[min(i,j), max(i,j)] -= count * (hσσδ * (σ[i]*σ[j] / σδ**2) - gσδ * σ[i]*σ[j] / σδ**3)
+
+                        gh.h_diag[self.n + i] -= count * (hσσδ * (σ[i]/σδ)**2 + gσδ * σ[j]**2/σδ**3)
+                        gh.h_diag[self.n + j] -= count * (hσσδ * (σ[j]/σδ)**2 + gσδ * σ[i]**2/σδ**3)
+                        gh.h_nodiag[self.n + min(i,j), self.n + max(i,j)] -= count * (hσσδ * (σ[i]*σ[j] / σδ**2) - gσδ * σ[i]*σ[j] / σδ**3)
+
+                        # gh.hμσ()[i,i] -= count * hμσδ * σ[i] / σδ
+                        # gh.hμσ()[i,j] -= count * hμσδ * σ[j] / σδ
+                        # gh.hμσ()[j,i] -= count *  (-hμσδ * σ[i] / σδ)
+                        # gh.hμσ()[j,j] -= count *  (-hμσδ * σ[j] / σδ)
+
+                        gh.h_nodiag[i, self.n + i] -= count * hμσδ * σ[i] / σδ
+                        gh.h_nodiag[i, self.n + j] -= count * hμσδ * σ[j] / σδ
+                        gh.h_nodiag[j, self.n + i] -= count *  (-hμσδ * σ[i] / σδ)
+                        gh.h_nodiag[j, self.n + j] -= count *  (-hμσδ * σ[j] / σδ)
 
         return gh
 
@@ -638,7 +692,7 @@ def test():
     v = VBayes(m)
 
     instance = m.rvs()
-    obs = instance.observe(50*50*1000)
+    obs = instance.observe(10)
 
 
 
