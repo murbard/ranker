@@ -98,7 +98,7 @@ class Instance():
                 p = expit(self.z[i] - self.z[j])
                 obs[i, j] = np.random.binomial(counts[i * self.n + j], p)
                 obs[j, i] = counts[i * self.n + j] - obs[i, j]
-        return obs
+        return coo_matrix(obs)
 
     def match(self, i, j):
         return np.random.rand() < expit(self.z[i] - self.z[j])
@@ -114,10 +114,11 @@ class GradientHessian():
         # use sparse matrix instead
         self.h = linalg.LinearOperator((2*n+2, 2*n+2), matvec=self.matvec)
 
-        self.h_diag = zeros(2*n+2)
-        self.h_αβ = zeros(2,2)
-        self.h_μσαβ = zeros(2*n,2*n)
-        self.h_obs = coo_matrix((2*n, 2*n))
+        self.h_diag = zeros(2*n+2) # the diagolanl
+        self.h_αβ = zeros(2,2) # the off diagonal terms between α and β
+        self.h_μσαβ = zeros(2*n,2) # the terms between μ σ on the one hand and α and β on the other
+        self.h_μσ = zeros(n) # a diagonal matrix of the terms between μ and σ
+        self.h_obs = coo_matrix((2*n, 2*n)) # the off diagonal terms coming from observations, relating
 
     def matvec(self, x):
         res =  self.h_diag * x
@@ -286,65 +287,59 @@ class VBayes():
         if dobs is not None and not compute_gradient:
             raise "Must compute the gradient if dobs is being computer"
 
-        for i in range(0, self.n):
-            for j in range(0, self.n):
-                if obs[i, j] == 0 and dobs is None:
-                    continue
-                else:
-                    count = obs[i, j]
+        h_obs = obs.copy()
 
-                σδ = sqrt(σ[i]**2 + σ[j]**2)
-                μδ = μ[i] - μ[j]
-                h = sqrt(16/π + 2 * σδ**2)
+        for (k, (count, i, j)) in enumerate(zip(obs.data,obs.col):
+        
+            σδ = sqrt(σ[i]**2 + σ[j]**2)
+            μδ = μ[i] - μ[j]
+            h = sqrt(16/π + 2 * σδ**2)
 
-                gh.val += count * (exp(-(μδ/h)**2) *  h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h)))
+            gh.val += count * (exp(-(μδ/h)**2) *  h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h)))
 
-                if compute_gradient:
+            if compute_gradient:
 
-                    gμδ = - 1 / 2 * (1 - erf(μδ / h)) # negative
-                    gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h)  # negative, but this is subtracted so, so this makes σ smaller
+                gμδ = - 1 / 2 * (1 - erf(μδ / h)) # negative
+                gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h)  # negative, but this is subtracted so, so this makes σ smaller
 
-                    gh.gμ()[i] -= count * (-gμδ)
-                    gh.gμ()[j] -= count * gμδ
+                gh.gμ()[i] -= count * (-gμδ)
+                gh.gμ()[j] -= count * gμδ
 
-                    gh.gσ()[i] -= count * (gσδ * σ[i] / σδ)
-                    gh.gσ()[j] -= count * (gσδ * σ[j] / σδ)
+                gh.gσ()[i] -= count * (gσδ * σ[i] / σδ)
+                gh.gσ()[j] -= count * (gσδ * σ[j] / σδ)
 
-                    if dobs is not None:
-                            dobs[i,j, 0] = - gσδ  / σδ
-                            dobs[i, j, 1] = gμδ
+                if dobs is not None:
+                        dobs[i,j, 0] = - gσδ  / σδ
+                        dobs[i, j, 1] = gμδ
 
-                    if compute_hessian:
+                if compute_hessian:
 
-                        hμμδ = - exp(-(μδ/h)**2) / (sqrt(π) * h)
-                        hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3)
-                        hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + μδ**2)) / (π**(5/2) * h**5)
+                    hμμδ = - exp(-(μδ/h)**2) / (sqrt(π) * h)
+                    hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3)
+                    hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + μδ**2)) / (π**(5/2) * h**5)                      
 
-                        #gh.hμμ()[i,i] -= count * hμμδ
-                        #gh.hμμ()[j,j] -= count * hμμδ
-                        #gh.hμμ()[min(i,j), max(i,j)] -= count * (-hμμδ)
+                    gh.h_diag[i] -= count * hμμδ
+                    gh.h_diag[j] -= count * hμμδ
 
-                        gh.h_diag[i] -= count * hμμδ
-                        gh.h_diag[j] -= count * hμμδ
-                        gh.h_nodiag[min(i,j), max(i,j)] -= count * (-hμμδ)
+                    gh.h_obs[i, j] -= count * hμσδ
+                    gh.h_nodiag[min(i,j), max(i,j)] -= count * (-hμμδ) 
 
-                        # gh.hσσ()[i,i] -= count * (hσσδ * (σ[i]/σδ)**2 + gσδ * σ[j]**2/σδ**3)
-                        # gh.hσσ()[j,j] -= count * (hσσδ * (σ[j]/σδ)**2 + gσδ * σ[i]**2/σδ**3)
-                        # gh.hσσ()[min(i,j), max(i,j)] -= count * (hσσδ * (σ[i]*σ[j] / σδ**2) - gσδ * σ[i]*σ[j] / σδ**3)
+                    
+                    gh.h_diag[self.n + i] -= count * (hσσδ * (σ[i]/σδ)**2 + gσδ * σ[j]**2/σδ**3)
+                    gh.h_diag[self.n + j] -= count * (hσσδ * (σ[j]/σδ)**2 + gσδ * σ[i]**2/σδ**3)
 
-                        gh.h_diag[self.n + i] -= count * (hσσδ * (σ[i]/σδ)**2 + gσδ * σ[j]**2/σδ**3)
-                        gh.h_diag[self.n + j] -= count * (hσσδ * (σ[j]/σδ)**2 + gσδ * σ[i]**2/σδ**3)
-                        gh.h_nodiag[self.n + min(i,j), self.n + max(i,j)] -= count * (hσσδ * (σ[i]*σ[j] / σδ**2) - gσδ * σ[i]*σ[j] / σδ**3)
+                    
+                    gh.h_nodiag[self.n + min(i,j), self.n + max(i,j)] -= count * (hσσδ * (σ[i]*σ[j] / σδ**2) - gσδ * σ[i]*σ[j] / σδ**3)
 
-                        # gh.hμσ()[i,i] -= count * hμσδ * σ[i] / σδ
-                        # gh.hμσ()[i,j] -= count * hμσδ * σ[j] / σδ
-                        # gh.hμσ()[j,i] -= count *  (-hμσδ * σ[i] / σδ)
-                        # gh.hμσ()[j,j] -= count *  (-hμσδ * σ[j] / σδ)
+                    # gh.hμσ()[i,i] -= count * hμσδ * σ[i] / σδ
+                    # gh.hμσ()[i,j] -= count * hμσδ * σ[j] / σδ
+                    # gh.hμσ()[j,i] -= count *  (-hμσδ * σ[i] / σδ)
+                    # gh.hμσ()[j,j] -= count *  (-hμσδ * σ[j] / σδ)
 
-                        gh.h_nodiag[i, self.n + i] -= count * hμσδ * σ[i] / σδ
-                        gh.h_nodiag[i, self.n + j] -= count * hμσδ * σ[j] / σδ
-                        gh.h_nodiag[j, self.n + i] -= count *  (-hμσδ * σ[i] / σδ)
-                        gh.h_nodiag[j, self.n + j] -= count *  (-hμσδ * σ[j] / σδ)
+                    gh.h_nodiag[i, self.n + i] -= count * hμσδ * σ[i] / σδ
+                    gh.h_nodiag[i, self.n + j] -= count * hμσδ * σ[j] / σδ
+                    gh.h_nodiag[j, self.n + i] -= count *  (-hμσδ * σ[i] / σδ)
+                    gh.h_nodiag[j, self.n + j] -= count *  (-hμσδ * σ[j] / σδ)
 
         return gh
 
