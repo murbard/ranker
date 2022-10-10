@@ -208,8 +208,8 @@ class VBayes():
             gh.gβ()[0] += 1 / β
 
         if compute_hessian:
-            gh.h_diag[2*self.n] += (1 + α) * polygamma(2, α)
-            gh.h_diag[2*self.n+1] += -1 / β**2
+            gh.h_diag[2*n] += (1 + α) * polygamma(2, α)
+            gh.h_diag[2*n+1] += -1 / β**2
 
 
         # ∫ - Normal(µ, σ², z) log(Normal(µ, σ², z))
@@ -218,10 +218,9 @@ class VBayes():
         if compute_gradient:
             gh.gσ()[:] += - 1 / σ # we subtract the entropy gradient, so when we minimize this pushes σ to be bigger
         if compute_hessian:
-            gh.h_diag[self.n:2*self.n] += 1 / σ**2
+            gh.h_diag[n:2*n] += 1 / σ**2
 
         # ∫ - InvGamma(α, β, v) log( InvGamma(α', β', v)) dv
-
 
         gh.val += α * β / self.model.β + self.model.α * log(self.model.β) + gammaln(self.model.α) - (1 + self.model.α) * (log(β) + polygamma(0, α))
 
@@ -230,16 +229,12 @@ class VBayes():
             gh.gβ()[0] += α / self.model.β - (1 + self.model.α) / β
 
         if compute_hessian:
-            gh.h_diag[2*self.n] += -(1 + self.model.α) * polygamma(2, α)
-            gh.h_diag[2*self.n+1] += (1 + self.model.α) / β**2
+            gh.h_diag[2*n] += -(1 + self.model.α) * polygamma(2, α)
+            gh.h_diag[2*n+1] += (1 + self.model.α) / β**2
             gh.h_αβ[0, 1] += 1 / self.model.β
 
 
         # ∫∫ - InvGamma(α, β, v) Normal(μ, σ, z) log(Normal(0, √v)) dv dz
-
-
-
-        gh = out if out is not None else GradientHessian(self.n)
 
         gh.val += 1/2 * (α * β * (μ**2 + σ**2).sum() + n * (log(2 * π / β) - polygamma(0, α)))
 
@@ -250,49 +245,20 @@ class VBayes():
             gh.gβ()[0] += 1/2 * (α * (μ**2 + σ**2).sum() - n / β)
 
         if compute_hessian:
-            # gh.hαα()[0] += - 1 / 2 * n * polygamma(2, α)
-            # gh.hαβ()[0] += 1/2 * (μ**2 + σ**2).sum()
-            # gh.hββ()[0] += n / (2 * β**2)
 
-            gh.h_diag[2*self.n] += - 1 / 2 * n * polygamma(2, α)
-            gh.h_nodiag[2*self.n, 2*self.n+1] += 1/2 * (μ**2 + σ**2).sum()
-            gh.h_diag[2*self.n+1] += n / (2 * β**2)
+            gh.h_diag[2*n] += - 1 / 2 * n * polygamma(2, α)
+            gh.h_αβ[0, 1] += 1/2 * (μ**2 + σ**2).sum()
+            gh.h_diag[2*n+1] += n / (2 * β**2)
 
-            # gh.hμα()[:,0] += β * μ
-            # gh.hμβ()[:,0] += α * μ
-            # gh.hσα()[:,0] += β * σ
-            # gh.hσβ()[:,0] += α * σ
-            # gh.hμμ()[:] += α * β * np.eye(n)
-            # gh.hσσ()[:] += α * β * np.eye(n)
-
-            gh.h_nodiag[:self.n, 2*self.n] += β * μ
-            gh.h_nodiag[:self.n, 2*self.n+1] += α * μ
-            gh.h_nodiag[self.n:2*self.n, 2*self.n] += β * σ
-            gh.h_nodiag[self.n:2*self.n, 2*self.n+1] += α * σ
-            gh.h_diag[:2*self.n] += α * β
-
-        return gh
+            gh.h_μσαβ[:n, 0] += β * μ
+            gh.h_μσαβ[:n, 1] += α * μ
+            gh.h_μσαβ[n:, 0] += β * σ
+            gh.h_μσαβ[n:, 1] += α * σ
+            gh.h_diag[:2*n] += α * β
 
 
         # Σ_ij  o[i,j] ∫ Normal(μi - μj, √(σi²+σj²), δ) log(1 + e^(-δ)) dδ
-        self.__minus_observations__(obs, compute_gradient, compute_hessian, dobs=dobs, out=gh)
 
-        if np.any(np.isnan(gh.g)):
-            raise ValueError("NaN in gradient")
-        if np.any(np.isnan(gh.h)):
-            raise ValueError("NaN in hessian")
-        return gh
-
-
-
-
-    def __normal_cross_entropy__(self, compute_gradient = False, compute_hessian = False, out = None):
-        """ gradient of ∫∫ - InvGamma(α, β, v) Normal(μ, σ, z) log(Normal(0, √v)) dv dz """
-        α, β = self.α()[0], self.β()[0]
-        µ, σ = self.µ(), self.σ()
-
-    def __minus_observations__(self, obs, compute_gradient = True, compute_hessian = True, dobs = None, out = None):
-        """ Σ_ij  o[i,j] ∫ Normal(μi - μj, √(σi²+σj²), δ) log(1 + e^(-δ)) dδ """
         # let σ = √(σi²+σj²) and μ = μi - μj
         # dμ / dμi = 1
         # dμ / dμj = -1
@@ -319,11 +285,6 @@ class VBayes():
 
         if dobs is not None and not compute_gradient:
             raise "Must compute the gradient if dobs is being computer"
-
-
-        µ, σ = self.µ(), self.σ()
-
-        gh = out if out is not None else GradientHessian(self.n)
 
         for i in range(0, self.n):
             for j in range(0, self.n):
@@ -389,22 +350,13 @@ class VBayes():
 
 
 
+        if np.any(np.isnan(gh.g)):
+            raise ValueError("NaN in gradient")
+        if np.any(np.isnan(gh.h)):
+            raise ValueError("NaN in hessian")
+        return gh
 
-    def fit_lbfgs(self, obs, maxiter = 1000, maxfun = 1000, maxcor = 10, ftol = 1e-8, gtol = 1e-12, disp = False, callback = None):
-        # Fit the parameters using the L-BFGS algorithm
 
-
-
-        def f(x):
-            self.params = x
-            gh = self.eval(obs, compute_gradient = True, compute_hessian = False)
-            return gh.val, gh.g
-
-        x0 = self.params.copy()
-        res = minimize(f, x0, method='L-BFGS-B',
-        bounds=[(-inf, inf)] * self.n + [(1e-6, inf)] * (self.n + 2),
-         jac=True, hess=False, options={'maxiter': maxiter, 'maxfun': maxfun, 'maxcor': maxcor, 'ftol': ftol, 'gtol': gtol, 'disp': disp, 'callback': callback})
-        self.params = res.x
 
     def fit(self, obs, niter=100000, tol=1e-8, verbose=True, λ0 = 1e-10):
 
