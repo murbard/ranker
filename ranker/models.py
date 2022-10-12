@@ -71,7 +71,7 @@ class Model():
     def entropy(self):
         return invgamma.entropy(self.α, scale=1/self.β) + norm.entropy(scale=sqrt(self.v)) * self.n
 
-    def rvs(self):        
+    def rvs(self):
         v = invgamma.rvs(self.α, scale=1/self.β, random_state=rng)
         return Instance(v, norm.rvs(loc=0, scale=sqrt(v), size=self.n, random_state=rng))
 
@@ -115,7 +115,7 @@ class GradientHessian():
     def __init__(self, n):
         self.val = 0
         self.n = n
-        self.g = zeros(2*n+2)                
+        self.g = zeros(2*n+2)
         self.h_diag = zeros(2*n+2) # the diagolanl
         self.h_αβ = zeros((2,2)) # the off diagonal terms between α and β
         self.h_μσαβ = zeros((2*n,2)) # the terms between μ σ on the one hand and α and β on the other
@@ -217,7 +217,7 @@ class VBayes():
             gh.gβ()[0] += 1 / β
 
         if compute_hessian:
-            gh.h_diag[2*n] += (1 + α) * polygamma(2, α)
+            gh.h_diag[2*n] += polygamma(1, α) + (1 + α) * polygamma(2, α)
             gh.h_diag[2*n+1] += -1 / β**2
 
 
@@ -299,8 +299,8 @@ class VBayes():
         gh.h_obs = coo_matrix((np.empty(l), (zeros(l,dtype=np.int32), zeros(l,dtype=np.int32))),shape=(2*n,2*n))
 
         k = 0
-        for (count, i, j) in zip(obs.data,obs. row, obs.col):
-        
+        for (count, i, j) in zip(obs.data, obs.row, obs.col):
+
             σδ = sqrt(σ[i]**2 + σ[j]**2)
             μδ = μ[i] - μ[j]
             h = sqrt(16/π + 2 * σδ**2)
@@ -326,7 +326,7 @@ class VBayes():
 
                     hμμδ = - exp(-(μδ/h)**2) / (sqrt(π) * h)
                     hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3)
-                    hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + μδ**2)) / (π**(5/2) * h**5)                      
+                    hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + μδ**2)) / (π**(5/2) * h**5)
 
                     # Diagonal terms, hμiμi, hμjμj, hσiσi, hσjσj
                     gh.h_diag[i] -= count * hμμδ
@@ -336,45 +336,45 @@ class VBayes():
                     gh.h_diag[self.n + j] -= count * (hσσδ * (σ[j]/σδ)**2 + gσδ * σ[i]**2/σδ**3)
 
                     # hμiμj
-                    gh.h_obs.data[k] = count * hμσδ
-                    gh.h_obs.col[k] = min(i,j)
-                    gh.h_obs.row[k] = max(i,j)             
+                    gh.h_obs.data[k] = count * hμμδ
+                    gh.h_obs.row[k] = min(i,j)
+                    gh.h_obs.col[k] = max(i,j)
                     k += 1
-                                        
+
                     # hσiσj
                     gh.h_obs.data[k] = - count * (hσσδ * (σ[i]*σ[j] / σδ**2) - gσδ * σ[i]*σ[j] / σδ**3)
-                    gh.h_obs.col[k] =  n + min(i,j)
-                    gh.h_obs.row[k] =  n + max(i,j)
+                    gh.h_obs.row[k] =  n + min(i,j)
+                    gh.h_obs.col[k] =  n + max(i,j)
                     k += 1
-                    
-                    # hμiσi, 
+
+                    # hμiσi,
                     gh.h_obs.data[k] = - count * hμσδ * σ[i] / σδ
-                    gh.h_obs.col[k] = i
-                    gh.h_obs.row[k] = n + i
+                    gh.h_obs.row[k] = i
+                    gh.h_obs.col[k] = n + i
                     k += 1
-                    
+
                     # hμiσj
                     gh.h_obs.data[k] = - count * hμσδ * σ[j] / σδ
-                    gh.h_obs.col[k] = i
-                    gh.h_obs.row[k] = n + j
+                    gh.h_obs.row[k] = i
+                    gh.h_obs.col[k] = n + j
                     k += 1
-                    
+
                     # hμjσi
                     gh.h_obs.data[k] = count * hμσδ * σ[i] / σδ
-                    gh.h_obs.col[k] = j
-                    gh.h_obs.row[k] = n + i
+                    gh.h_obs.row[k] = j
+                    gh.h_obs.col[k] = n + i
                     k += 1
 
                     # hμjσj
-                    gh.h_obs.data[k] = count * hμσδ * σ[j] / σδ                
-                    gh.h_obs.col[k] = j
-                    gh.h_obs.row[k] = n + j
+                    gh.h_obs.data[k] = count * hμσδ * σ[j] / σδ
+                    gh.h_obs.row[k] = j
+                    gh.h_obs.col[k] = n + j
                     k += 1
 
-        if gh.nans_in_grad():        
+        if gh.nans_in_grad():
             raise ValueError("NaN in gradient")
-        if gh.nans_in_hess():        
-            raise ValueError("NaN in hessian")            
+        if gh.nans_in_hess():
+            raise ValueError("NaN in hessian")
         return gh
 
 
@@ -402,8 +402,8 @@ class VBayes():
             for (k, (i, j)) in enumerate(zip(gh.h_obs.row, gh.h_obs.col)):
                 if i >= self.n and j >= self.n:
                     gh.h_obs.data[k] *= self.params[i] * self.params[j]
-            
-            gh.g[self.n:] *= self.params[self.n:]            
+
+            gh.g[self.n:] *= self.params[self.n:]
 
             gh.h_diag[self.n:] += gh.g[self.n:]
 
@@ -413,16 +413,16 @@ class VBayes():
 
             # condition by the diagonal
             sd = 1 / sqrt(gh.h_diag)
-            
+
             gh.h_diag *= sd * sd
 
             gh.h_αβ *= np.outer(sd[-2:],sd[-2:])
             gh.h_μσ *= sd[self.n:-2]
             gh.h_μσαβ *= np.outer(sd[:-2], sd[-2:])
 
-            for (k, (i, j)) in enumerate(zip(gh.h_obs.row, gh.h_obs.col)):                
+            for (k, (i, j)) in enumerate(zip(gh.h_obs.row, gh.h_obs.col)):
                 gh.h_obs.data[k] *= sd[i] * sd[j]
-                        
+
             gh.g *= sd
 
             while True:
@@ -639,7 +639,7 @@ test()
 
 
 if __name__ == '__main__':
-    
+
     κstats = []
     # lp = LineProfiler()
     # lp.add_function(VBayes.eval)
