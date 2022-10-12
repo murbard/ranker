@@ -606,12 +606,7 @@ class VBayes():
             k = k + 1
 
         gains = gains[np.lexsort(gains.T[::-1])]
-
-
         return gains
-
-
-
 
 
 def test():
