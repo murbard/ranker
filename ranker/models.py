@@ -64,8 +64,8 @@ class Model():
         return invgamma.entropy(self.α, scale=1/self.β) + norm.entropy(scale=sqrt(self.v)) * self.n
 
     def rvs(self):
-        v = invgamma.rvs(self.α, scale=1/self.β)
-        return Instance(v, norm.rvs(loc=0, scale=sqrt(v), size=self.n))
+        v = invgamma.rvs(self.α, scale=1/self.β, random_state=rng)
+        return Instance(v, norm.rvs(loc=0, scale=sqrt(v), size=self.n, random_state=rng))
 
     def logP(self, instance, obs):
         return (
@@ -208,7 +208,7 @@ class VBayes():
         return invgamma(self.α(), scale=1/self.β()).entropy() + norm(loc=self.μ(), scale=self.σ()).entropy().sum()
 
     def rvs(self):
-        return Instance(invgamma.rvs(self.α()[0], scale=1/self.β()[0]), norm.rvs(loc=self.µ(), scale=self.σ()))
+        return Instance(invgamma.rvs(self.α()[0], scale=1/self.β()[0], random_state=rng), norm.rvs(loc=self.µ(), scale=self.σ(), random_state=rng))
 
 
     def __minus_invgamma_entropy__(self, compute_gradient = True, compute_hessian = True, out = None):
