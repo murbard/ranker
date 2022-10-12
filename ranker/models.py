@@ -23,6 +23,8 @@ except ImportError:
 
 κstats = []
 
+rng = np.random.default_rng(12345)
+
 def almost_log_expit(x):
     return - 2 * exp(- π * x**2 / 16) / π + x / 2 * erfc(sqrt(π) * x / 4)
 
@@ -69,9 +71,9 @@ class Model():
     def entropy(self):
         return invgamma.entropy(self.α, scale=1/self.β) + norm.entropy(scale=sqrt(self.v)) * self.n
 
-    def rvs(self):
-        v = invgamma.rvs(self.α, scale=1/self.β)
-        return Instance(v, norm.rvs(loc=0, scale=sqrt(v), size=self.n))
+    def rvs(self):        
+        v = invgamma.rvs(self.α, scale=1/self.β, random_state=rng)
+        return Instance(v, norm.rvs(loc=0, scale=sqrt(v), size=self.n, random_state=rng))
 
     def logP(self, instance, obs):
         return (
@@ -91,18 +93,21 @@ class Instance():
 
     def observe(self, n_obs):
         obs = np.zeros((self.n, self.n))
-        ps = np.empty(self.n * self.n)
-        ps.fill(1.0 / (self.n * self.n))
-        counts = np.random.multinomial(n_obs, ps)
+        ps = np.empty(self.n * (self.n - 1) // 2)
+        ps.fill(1.0 / len(ps))
+        counts = rng.multinomial(n_obs, ps)
+        k = 0
         for i in range(self.n):
-            for j in range(self.n):
+            for j in range(i + 1, self.n):
                 p = expit(self.z[i] - self.z[j])
-                obs[i, j] = np.random.binomial(counts[i * self.n + j], p)
-                obs[j, i] = counts[i * self.n + j] - obs[i, j]
+                obs[i, j] = rng.binomial(counts[k], p)
+                obs[j, i] = counts[k] - obs[i, j]
+                k += 1
         return coo_matrix(obs)
 
+
     def match(self, i, j):
-        return np.random.rand() < expit(self.z[i] - self.z[j])
+        return rng.rand() < expit(self.z[i] - self.z[j])
 
 
 class GradientHessian():
@@ -187,7 +192,7 @@ class VBayes():
         return invgamma(self.α(), scale=1/self.β()).entropy() + norm(loc=self.μ(), scale=self.σ()).entropy().sum()
 
     def rvs(self):
-        return Instance(invgamma.rvs(self.α()[0], scale=1/self.β()[0]), norm.rvs(loc=self.µ(), scale=self.σ()))
+        return Instance(invgamma.rvs(self.α()[0], scale=1/self.β()[0], random_state=rng), norm.rvs(loc=self.µ(), scale=self.σ(), random_state=rng))
 
 
     def eval(self, obs, compute_gradient = False, compute_hessian = False, dobs = None):
@@ -639,7 +644,7 @@ test()
 
 
 if __name__ == '__main__':
-    np.random.seed(0)
+    
     κstats = []
     # lp = LineProfiler()
     # lp.add_function(VBayes.eval)
