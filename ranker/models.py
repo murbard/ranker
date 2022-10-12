@@ -299,7 +299,7 @@ class VBayes():
         gh.h_obs = coo_matrix((np.empty(l), (zeros(l,dtype=np.int32), zeros(l,dtype=np.int32))),shape=(2*n,2*n))
 
         k = 0
-        for (count, i, j) in zip(obs.data,obs.col, obs.row):
+        for (count, i, j) in zip(obs.data,obs. row, obs.col):
         
             σδ = sqrt(σ[i]**2 + σ[j]**2)
             μδ = μ[i] - μ[j]
