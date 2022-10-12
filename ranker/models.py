@@ -292,8 +292,16 @@ class VBayes():
         if compute_hessian and not compute_gradient:
             raise "Must compute the gradient if the hessian is being computed"
 
-        if dobs is not None and not compute_gradient:
-            raise "Must compute the gradient if dobs is being computer"
+        if dobs is not None:
+            for i in range(self.n):
+                for j in range(self.n):
+                    σδ = sqrt(σ[i]**2 + σ[j]**2)
+                    μδ = μ[i] - μ[j]
+                    h = sqrt(16/π + 2 * σδ**2)
+                    gμδ = - 1 / 2 * (1 - erf(μδ / h)) # negative
+                    gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h)  # negative, but this is subtracted so, so this makes σ smaller
+                    dobs[i, j, 0] = - gσδ  / σδ
+                    dobs[i, j, 1] = gμδ
 
         l = 6 * len(obs.data)
         gh.h_obs = coo_matrix((np.empty(l), (zeros(l,dtype=np.int32), zeros(l,dtype=np.int32))),shape=(2*n,2*n))
@@ -301,7 +309,7 @@ class VBayes():
         k = 0
         for (count, i, j) in zip(obs.data, obs.row, obs.col):
 
-            σδ = sqrt(σ[i]**2 + σ[j]**2)
+            σδ = sqrt(σ[i]**2 + σ[j]**2) #todo, don't repeat computation with dobs if we can avoid
             μδ = μ[i] - μ[j]
             h = sqrt(16/π + 2 * σδ**2)
 
@@ -318,9 +326,6 @@ class VBayes():
                 gh.gσ()[i] -= count * (gσδ * σ[i] / σδ)
                 gh.gσ()[j] -= count * (gσδ * σ[j] / σδ)
 
-                if dobs is not None:
-                        dobs[i, j, 0] = - gσδ  / σδ
-                        dobs[i, j, 1] = gμδ
 
                 if compute_hessian:
 
@@ -371,9 +376,10 @@ class VBayes():
                     gh.h_obs.col[k] = n + j
                     k += 1
 
-        if gh.nans_in_grad():
+
+        if compute_gradient and gh.nans_in_grad():
             raise ValueError("NaN in gradient")
-        if gh.nans_in_hess():
+        if compute_hessian and gh.nans_in_hess():
             raise ValueError("NaN in hessian")
         return gh
 
@@ -425,6 +431,9 @@ class VBayes():
 
             gh.g *= sd
 
+           # H = np.array([gh.h.dot(c) for c in np.eye(2*self.n+2, 2*self.n+2)])
+           #  print(np.linalg.cond(H))
+
             while True:
                 try:
                     # κ = np.linalg.cond(gh.h + np.diag(np.diag(gh.h) * (1 + λ)))
@@ -432,7 +441,9 @@ class VBayes():
 
                     # diff =  sd * linalg.solve(gh.h + np.diag(np.diag(gh.h) * (1 + λ)), gh.g, assume_a='sym')
                     # solve with sparse.linalg.cg
+                    gh.h_diag *= (1 + λ)
                     diff = sd * cg(gh.h, gh.g, tol=1e-8, atol=1e-12)[0]
+                    gh.h_diag /= (1 + λ)
 
                     old_params = self.params.copy()
                     self.params[:self.n] -= diff[:self.n]
@@ -565,7 +576,7 @@ class VBayes():
             case _:
                 raise ValueError(f"target must be one of {targets}")
 
-        factor = -linalg.solve(gh.h, df_dparam, assume_a='sym')
+        factor = -cg(gh.h, df_dparam, tol=1e-8, atol=1e-12)[0]
 
         gains = []
         if possible_pairs is None:
@@ -589,16 +600,22 @@ class VBayes():
             print(k/len(possible_pairs))
             # i, j = round(gains[k,1]), round(gains[k,2])
             old_params = self.params.copy()
-            obs[i, j] += 1
+
+            obs.data = np.append(obs.data, 1)
+            obs.row = np.append(obs.row, i)
+            obs.col = np.append(obs.col, j)
+
             self.fit(verbose=False, obs=obs, tol=1e-6)
             win = self.expected_inversions()
-            obs[i, j] -= 1
             self.params = old_params.copy()
-            obs[j, i] += 1
+            obs.row[-1] = j
+            obs.col[-1] = i
             self.fit(verbose=False, obs=obs, tol=1e-6)
             lose = self.expected_inversions()
-            obs[j, i] -= 1
             self.params = old_params.copy()
+            obs.data = obs.data[:-1]
+            obs.row = obs.row[:-1]
+            obs.col = obs.col[:-1]
             p = self.prob_win(i, j)
             real_gains[k,0] = p * win + (1 - p) * lose - einv
             real_gains[k,1] = i
