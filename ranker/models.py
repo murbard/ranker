@@ -21,6 +21,8 @@ except ImportError:
 
 κstats = []
 
+rng = np.random.default_rng(12345)
+
 def almost_log_expit(x):
     return - 2 * exp(- π * x**2 / 16) / π + x / 2 * erfc(sqrt(π) * x / 4)
 
@@ -83,18 +85,20 @@ class Instance():
 
     def observe(self, n_obs):
         obs = np.zeros((self.n, self.n))
-        ps = np.empty(self.n * self.n)
-        ps.fill(1.0 / (self.n * self.n))
-        counts = np.random.multinomial(n_obs, ps)
+        ps = np.empty(self.n * (self.n - 1) // 2)
+        ps.fill(1.0 / len(ps))
+        counts = rng.multinomial(n_obs, ps)
+        k = 0
         for i in range(self.n):
-            for j in range(self.n):
+            for j in range(i + 1, self.n):
                 p = expit(self.z[i] - self.z[j])
-                obs[i, j] = np.random.binomial(counts[i * self.n + j], p)
-                obs[j, i] = counts[i * self.n + j] - obs[i, j]
+                obs[i, j] = rng.binomial(counts[k], p)
+                obs[j, i] = counts[k] - obs[i, j]
+                k += 1
         return obs
 
     def match(self, i, j):
-        return np.random.rand() < expit(self.z[i] - self.z[j])
+        return rng.rand() < expit(self.z[i] - self.z[j])
 
 
 class GradientHessian():
@@ -638,7 +642,7 @@ def test():
     v = VBayes(m)
 
     instance = m.rvs()
-    obs = instance.observe(50*50*1000)
+    obs = instance.observe(10)
 
 
 
@@ -663,6 +667,7 @@ test()
 
 
 if __name__ == '__main__':
+    
     κstats = []
     # lp = LineProfiler()
     # lp.add_function(VBayes.eval)
