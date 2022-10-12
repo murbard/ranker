@@ -20,7 +20,7 @@ except ImportError:
         return  -log(1 + exp(-np.abs(x))) + min(x, 0)
 
 κstats = []
-
+sym = lambda x : x.T + x - np.diag(np.diag(x))
 rng = np.random.default_rng(12345)
 
 def almost_log_expit(x):
@@ -425,7 +425,7 @@ class VBayes():
          jac=True, hess=False, options={'maxiter': maxiter, 'maxfun': maxfun, 'maxcor': maxcor, 'ftol': ftol, 'gtol': gtol, 'disp': disp, 'callback': callback})
         self.params = res.x
 
-    def fit(self, obs, niter=100000, tol=1e-8, verbose=True, λ0 = 1e-10):
+    def fit(self, obs, niter=100000, tol=1e-8, verbose=True, λ0 = 1e-10, enforce_positive=True):
 
         global κstats
         last_val = None
@@ -437,19 +437,24 @@ class VBayes():
                 break
             last_val = gh.val
 
-            # newton update for the log of positive parameters
-            gh.h[self.n:,self.n:] *= self.params[self.n:].reshape(-1,1).dot(self.params[self.n:].reshape(1,-1))
-            gh.g[self.n:] *= self.params[self.n:]
-            gh.h[self.n:,self.n:] += np.diag(gh.g[self.n:])
+            if enforce_positive:
+            # # newton update for the log of positive parameters
+                gh.h[self.n:,self.n:] *= self.params[self.n:].reshape(-1,1).dot(self.params[self.n:].reshape(1,-1))
+                gh.g[self.n:] *= self.params[self.n:]
+                gh.h[self.n:,self.n:] += np.diag(gh.g[self.n:])
 
 
             if np.any(np.diag(gh.h) < 0):
                 raise "negative diagonal"
 
+
+
             # condition by the diagonal
             sd = 1 / sqrt(np.diag(gh.h))
             gh.h *= np.outer(sd,sd)
             gh.g *= sd
+
+            print(np.linalg.cond(sym(gh.h)))
 
             while True:
                 try:
@@ -458,9 +463,13 @@ class VBayes():
                     diff =  sd * linalg.solve(gh.h + np.diag(np.diag(gh.h) * (1 + λ)), gh.g, assume_a='sym')
 
                     old_params = self.params.copy()
-                    self.params[:self.n] -= diff[:self.n]
-                    factor = exp(-diff[self.n:])
-                    self.params[self.n:] *= factor
+
+                    if enforce_positive:
+                        self.params[:self.n] -= diff[:self.n]
+                        factor = exp(-diff[self.n:])
+                        self.params[self.n:] *= factor
+                    else:
+                        self.params -= diff
 
                     if self.eval(obs).val < gh.val: # if it's better stop
                         if verbose and λ > λ0:
@@ -667,7 +676,7 @@ test()
 
 
 if __name__ == '__main__':
-    
+
     κstats = []
     # lp = LineProfiler()
     # lp.add_function(VBayes.eval)
