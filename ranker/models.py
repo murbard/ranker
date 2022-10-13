@@ -29,6 +29,31 @@ def almost_log_expit(x):
     return - 2 * exp(- π * x**2 / 16) / π + x / 2 * erfc(sqrt(π) * x / 4)
 
 
+def condest(lf, maxiter=100):
+    v = rng.standard_normal(lf.shape[1])
+    v = v / np.linalg.norm(v)
+    for _ in range(maxiter):
+        w = lf.dot(v)
+        emax = np.linalg.norm(w)
+        w /= emax
+        if np.linalg.norm(v - w) < 1e-8:
+            break
+        v = w
+    v = rng.standard_normal(lf.shape[1])
+    v = v / np.linalg.norm(v)
+    for _ in range(maxiter):
+        w = cg(lf, v, tol=1e-8, atol=1e-10)[0]
+        emin = np.linalg.norm(w)
+        w /= emin
+        if np.linalg.norm(v - w) < 1e-8:
+            break
+        v = w
+    return emax * emin
+
+
+
+
+
 # TODO:
 # Use a sparse Matrix to represent the Hessian
 # use scipy sparse cg to solve the linear system, scipy.sparse.linalg.cg
@@ -99,9 +124,10 @@ class Instance():
         k = 0
         for i in range(self.n):
             for j in range(i + 1, self.n):
-                p = expit(self.z[i] - self.z[j])
-                obs[i, j] = rng.binomial(counts[k], p)
-                obs[j, i] = counts[k] - obs[i, j]
+                if counts[k]>0:
+                    p = expit(self.z[i] - self.z[j])
+                    obs[i, j] = rng.binomial(counts[k], p)
+                    obs[j, i] = counts[k] - obs[i, j]
                 k += 1
         return coo_matrix(obs)
 
@@ -418,6 +444,7 @@ class VBayes():
                 raise RuntimeError("negative diagonal")
 
             # condition by the diagonal
+            # todo, introduce Cholesky factorisation of the corner 2x2 matrix?
             sd = 1 / sqrt(gh.h_diag)
 
             gh.h_diag *= sd * sd
@@ -430,9 +457,12 @@ class VBayes():
                 gh.h_obs.data[k] *= sd[i] * sd[j]
 
             gh.g *= sd
+            H = np.array([gh.h.dot(c) for c in np.eye(2*self.n+2, 2*self.n+2)])
+            print(condest(H))
 
-           # H = np.array([gh.h.dot(c) for c in np.eye(2*self.n+2, 2*self.n+2)])
-           #  print(np.linalg.cond(H))
+
+
+
 
             while True:
                 try:
@@ -627,11 +657,11 @@ class VBayes():
 
 
 def test():
-    m = Model(n=50)
+    m = Model(n=1000)
     v = VBayes(m)
 
     instance = m.rvs()
-    obs = instance.observe(10)
+    obs = instance.observe(1000 * 1000)
 
 
 
