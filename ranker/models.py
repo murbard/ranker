@@ -1,15 +1,14 @@
-from operator import pos
 from scipy.stats import invgamma, norm
-from scipy.special import gammaln, gamma, polygamma, erf, erfc, expit
-from scipy.integrate import quad
+from scipy.special import gammaln, polygamma, erf, erfc, expit
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import LinearOperator, cg
-from numpy import log, sqrt, exp, linspace, array, zeros, ones, arange, pi as π, inf, sign
+from numpy import log, sqrt, exp, sign, pi as π
+from numpy import zeros, ones, array, empty, concatenate, append, lexsort, any, isnan, all, int32, outer, eye
 import numpy as np
-import copy
 from scipy import linalg
 from scipy.optimize import minimize
 from matplotlib import pyplot as plt
+from utils import condest
 
 import warnings
 warnings.filterwarnings("error")
@@ -19,49 +18,39 @@ try:
     from scipy.special import log_expit
 except ImportError:
     def log_expit(x):
-        return  -log(1 + exp(-np.abs(x))) + min(x, 0)
-
-κstats = []
-
-rng = np.random.default_rng(12345)
+        return  -log(1 + exp(-abs(x))) + min(x, 0)
 
 def almost_log_expit(x):
     return - 2 * exp(- π * x**2 / 16) / π + x / 2 * erfc(sqrt(π) * x / 4)
 
 
-def condest(lf, maxiter=100):
-    v = rng.standard_normal(lf.shape[1])
-    v = v / np.linalg.norm(v)
-    for _ in range(maxiter):
-        w = lf.dot(v)
-        emax = np.linalg.norm(w)
-        w /= emax
-        if np.linalg.norm(v - w) < 1e-8:
-            break
-        v = w
-    v = rng.standard_normal(lf.shape[1])
-    v = v / np.linalg.norm(v)
-    for _ in range(maxiter):
-        w = cg(lf, v, tol=1e-8, atol=1e-10)[0]
-        emin = np.linalg.norm(w)
-        w /= emin
-        if np.linalg.norm(v - w) < 1e-8:
-            break
-        v = w
-    return emax * emin
+rng = np.random.default_rng(12345)
 
+# This file has all the docstrings required by Sphinx to generate the documentation.
 
+"""
+This module contains the Model, VBayes, Instance, and GradientHessian classes.
+The Model class contains the prior distribution over instances of the model. It can be sampled from to obtain an instance, and can compute the log-probability of an instance.
+The VBayes class is an implementation of the VB algorithm. It can be used to obtain the posterior distribution over instances of the model, and can compute the log-probability of an instance.
+The GradientHessian class is a helper class for computing the gradient and hessian of the log-probability of an instance.
+"""
 
-
-
-# TODO:
-# Use a sparse Matrix to represent the Hessian
-# use scipy sparse cg to solve the linear system, scipy.sparse.linalg.cg
-# set up a benchmark to compare my homebrew solution vs directly using scipy.minimize
 
 class Model():
+    """
+    A model can be sampled from to obtain an instance, and can compute the log-probability of an instance.
+    We model the latent variables as iid Gaussian with mean 0 and variance v, where v is drawn from an inverse gamma distribution.
+    """
 
     def __init__(self, n, α=1.2, β=2.0):
+        """
+        Constructs a model with n latent variables.
+        The prior distribution over v is an inverse gamma distribution with shape α and scale β.
+
+        :param n: number of latent variables
+        :param α: shape parameter of the inverse gamma prior over v
+        :param β: scale parameter of the inverse gamma prior over v
+        """
         self.n = n
         self.α = α
         self.β = β
@@ -91,34 +80,62 @@ class Model():
         # distribution for the variance.
         # chance of beat between adjacent stars
 
-
-
     def entropy(self):
+        """
+        Computes the entropy of the prior distribution over instances of the model.
+        """
         return invgamma.entropy(self.α, scale=1/self.β) + norm.entropy(scale=sqrt(self.v)) * self.n
 
     def rvs(self):
+        """
+        Samples an instance from the prior distribution over instances of the model.
+        """
         v = invgamma.rvs(self.α, scale=1/self.β, random_state=rng)
         return Instance(v, norm.rvs(loc=0, scale=sqrt(v), size=self.n, random_state=rng))
 
-    def logP(self, instance, obs):
-        return (
-            invgamma(self.α, scale=1/self.β).logpdf(instance.v) + norm(loc=0, scale=sqrt(instance.v)).logpdf(instance.z).sum() +
-            # log_expit([instance.z[o[0]] - instance.z[o[1]] for o in obs]).sum()
-            almost_log_expit(np.array([instance.z[o[0]] - instance.z[o[1]] for o in obs])).sum())
+    def logP(self, instance, obs, expit_approx=True):
+        """
+        Computes the log-probability of an instance given the observed data.
+        :param instance: an instance of the model
+        :param obs: an array of observed data
+        :param expit_approx: whether to use the approximation of the logit function
+        """        
+         
+        if expit_approx:
+            expit_val = almost_log_expit(array([instance.z[o[0]] - instance.z[o[1]] for o in obs])).sum()
+        else:
+            expit_val = log_expit([instance.z[o[0]] - instance.z[o[1]] for o in obs]).sum()
+
+        return expit_val +  invgamma(self.α, scale=1/self.β).logpdf(instance.v) + norm(loc=0, scale=sqrt(instance.v)).logpdf(instance.z).sum()
 
 class Instance():
+    """
+    An instance of a model.
+    """
 
     def __init__(self, v, z):
+        """
+        Constructs an instance of a model.
+        :param v: the variance of the latent variables
+        :param z: the latent variables
+        """
+        self.v = v
+        self.z = z
         self.v = v
         self.z = z
         self.n = len(z)
 
     def __repr__(self) -> str:
-        return f"Instance(√v={np.sqrt(self.v)}, z={self.z})"
+        return f"Instance(√v={sqrt(self.v)}, z={self.z})"
 
     def observe(self, n_obs):
-        obs = np.zeros((self.n, self.n))
-        ps = np.empty(self.n * (self.n - 1) // 2)
+        """
+        Samples n_obs observations from the instance.
+        Returns the observations as a coo_matrix.
+        :param n_obs: the number of observations to sample
+        """
+        obs = zeros((self.n, self.n))
+        ps = empty(self.n * (self.n - 1) // 2)
         ps.fill(1.0 / len(ps))
         counts = rng.multinomial(n_obs, ps)
         k = 0
@@ -130,15 +147,28 @@ class Instance():
                     obs[j, i] = counts[k] - obs[i, j]
                 k += 1
         return coo_matrix(obs)
-
-
+    
     def match(self, i, j):
+        """
+        Samples a match between items i and j from the instance.        
+        :param i: the first item
+        :param j: the second item
+        """
+        p = expit(self.z[i] - self.z[j])        
         return rng.rand() < expit(self.z[i] - self.z[j])
 
 
 class GradientHessian():
+    """
+    A helper class for computing the gradient and hessian of the log-probability of an instance.
+    """
 
     def __init__(self, n):
+        """
+        Constructs a helper class for computing the gradient and hessian of the log-probability of an instance.
+        :param n: the number of latent variables
+        """
+        self.n = n
         self.val = 0
         self.n = n
         self.g = zeros(2*n+2)
@@ -147,38 +177,67 @@ class GradientHessian():
         self.h_μσαβ = zeros((2*n,2)) # the terms between μ σ on the one hand and α and β on the other
         self.h_μσ = zeros(n) # a diagonal matrix of the terms between μ and σ
         self.h_obs = coo_matrix((2*n, 2*n)) # the off diagonal terms coming from observations, relating
-        self.h = LinearOperator((2*n+2, 2*n+2), matvec=self.matvec)
+        self.h = LinearOperator((2*n+2, 2*n+2), matvec=self.hdot) # the full hessian, as a linear operator
 
-    def matvec(self, x):
+    def hdot(self, x):
+        """
+        Computes the matrix-vector product of the hessian with a vector.
+        :param x: the vector to multiply with
+        """        
         res =  self.h_diag * x
-        res[-2:] += (self.h_αβ + self.h_αβ.T).dot(x[-2:])
-        res[:-2] += self.h_μσαβ.dot(x[-2:])
-        res[-2:] += self.h_μσαβ.T.dot(x[:-2])
-        res[:-2] += self.h_obs.dot(x[:-2]) + self.h_obs.T.dot(x[:-2])
+        res[-2:] += (self.h_αβ + self.h_αβ.T) @ (x[-2:])
+        res[:-2] += self.h_μσαβ @ x[-2:]
+        res[-2:] += self.h_μσαβ.T @ x[:-2]
+        res[:-2] += self.h_obs @ x[:-2] + self.h_obs.T @ x[:-2]
         return res
 
     def gα(self):
-        return self.g[2 * self.n: 2 * self.n+1]
+        """
+        Getter and setter for the gradient term corresponding to α.
+        """        
+        return self.g[-2:-1]
 
     def gβ(self):
-        return self.g[2 * self.n + 1 : 2 * self.n + 2]
+        """
+        Getter and setter for the gradient term corresponding to β.
+        """
+        return self.g[-1:]
 
     def gμ(self):
+        """
+        Getter and setter for the gradient term corresponding to μ.
+        """        
         return self.g[:self.n]
 
     def gσ(self):
+        """
+        Getter and setter for the gradient term corresponding to σ.
+        """        
         return self.g[self.n:2*self.n]
 
     def nans_in_grad(self):
-        return np.any(np.isnan(self.g))
+        """
+        Returns true if there are any nans in the gradient.
+        """
+        return any(isnan(self.g))
 
     def nans_in_hess(self):
-        return np.any(np.isnan(self.h_diag)) or np.any(np.isnan(self.h_αβ)) or np.any(np.isnan(self.h_μσαβ)) or np.any(np.isnan(self.h_μσ)) or np.any(np.isnan(self.h_obs.data))
+        """
+        Returns true if there are any nans in the hessian.
+        """
+        return any(isnan(self.h_diag)) or any(isnan(self.h_αβ)) or any(isnan(self.h_μσαβ)) or any(isnan(self.h_μσ)) or any(isnan(self.h_obs.data))
 
 
 class VBayes():
+    """
+    A class for performing variational bayes on a model.
+    The approximate posterior is a set independent normal distributions, and an inverse gamma distribution v.
+    """
 
     def __init__(self, model):
+        """
+        Constructs a class for performing variational bayes on a model.        
+        """
         self.model = model
 
         self.params = zeros(2*model.n+2)
@@ -200,28 +259,57 @@ class VBayes():
         self.params[2 * self.n + 1] = model.β
 
     def μ(self):
+        """
+        Getter and setter for the mean of the posterior of the latent variables.
+        """
         return self.params[:self.n]
 
     def σ(self):
+        """
+        Getter and setter for the standard deviation of the posterior of the latent variables.
+        """
         return self.params[self.n:2*self.n]
 
     def α(self):
+        """
+        Getter and setter for the shape parameter of the posterior of the variance.
+        """        
         return self.params[2*self.n : 2*self.n + 1]
 
     def β(self):
+        """
+        Getter and setter for the rate parameter of the posterior of the variance.
+        """
         return self.params[2*self.n+1 : 2*self.n + 2]
 
     def logQ(self, instance):
+        """
+        Computes the log-probability of the instance under the approximate posterior.
+        :param instance: the instance
+        """
         return invgamma(self.α()[0], scale=1/self.β()[0]).logpdf(instance.v) + norm(loc=self.µ(), scale=self.σ()).logpdf(instance.z).sum()
 
     def entropy(self):
+        """
+        Computes the entropy of the approximate posterior.
+        """
         return invgamma(self.α(), scale=1/self.β()).entropy() + norm(loc=self.μ(), scale=self.σ()).entropy().sum()
 
     def rvs(self):
+        """
+        Samples from the approximate posterior.
+        """
         return Instance(invgamma.rvs(self.α()[0], scale=1/self.β()[0], random_state=rng), norm.rvs(loc=self.µ(), scale=self.σ(), random_state=rng))
 
 
     def eval(self, obs, compute_gradient = False, compute_hessian = False, dobs = None):
+        """
+        Evaluates the variational lower bound on the log-likelihood of the data.
+        If compute_gradient is true, the gradient of the lower bound is computed.
+        If compute_hessian is true, the hessian of the lower bound is computed.
+        If dobs is not None, it is assumed to be a vector of the same size as obs and
+        is used to compute the gradient of the parameters with respect to the observations.
+        """
         # Compute the gradient of the paramters (µ, σ, α, β) with respect to the KL divergence
         # of the approximate posterior with the true posterior.
 
@@ -330,7 +418,7 @@ class VBayes():
                     dobs[i, j, 1] = gμδ
 
         l = 6 * len(obs.data)
-        gh.h_obs = coo_matrix((np.empty(l), (zeros(l,dtype=np.int32), zeros(l,dtype=np.int32))),shape=(2*n,2*n))
+        gh.h_obs = coo_matrix((empty(l), (zeros(l,dtype=int32), zeros(l,dtype=int32))),shape=(2*n,2*n))
 
         k = 0
         for (count, i, j) in zip(obs.data, obs.row, obs.col):
@@ -410,67 +498,57 @@ class VBayes():
         return gh
 
 
-
     def fit(self, obs, niter=100000, tol=1e-8, verbose=True, λ0 = 1e-10):
-
-        global κstats
+        """
+        Fit the model to the observed data.        
+        Uses a Newton-CG algorithm to find the maximum a posteriori estimate of the parameters.        
+        """
+        
         last_val = None
         for _ in range(niter):
             λ = λ0
             gh = self.eval(obs, compute_gradient=True, compute_hessian=True)
-            if last_val and np.abs(last_val - gh.val)/np.abs(gh.val) < tol and λ == λ0 or λ > 10000: # don't stop if we're still dampening the hessian, but do stop
-                # if it's gone too far
+            # don't stop if we're still dampening the hessian, but do stop if it's gone too far                
+            if last_val and abs(last_val - gh.val)/abs(gh.val) < tol and λ == λ0 or λ > 10000: 
                 break
             last_val = gh.val
 
-            # newton update for the log of positive parameters
-            # H = np.array([gh.h.dot(np.eye(2*self.n+2, 2*self.n+2)[i,:]) for i in range(2*self.n+2)])
-            # gh.h[self.n:,self.n:] *= self.params[self.n:].reshape(-1,1).dot(self.params[self.n:].reshape(1,-1))
+            # Newton update for the log of positive parameters
+            # For that we modify the gradient and the Hessian            
             gh.h_diag[self.n:] *= self.params[self.n:]**2
-            gh.h_αβ *= np.outer(self.params[-2:], self.params[-2:])
+            gh.h_αβ *= outer(self.params[-2:], self.params[-2:])
             gh.h_μσ *= self.params[self.n:-2]
-            gh.h_μσαβ[self.n:] *= np.outer(self.params[self.n:-2], self.params[-2:])
+            gh.h_μσαβ[self.n:] *= outer(self.params[self.n:-2], self.params[-2:])
 
             for (k, (i, j)) in enumerate(zip(gh.h_obs.row, gh.h_obs.col)):
                 if i >= self.n and j >= self.n:
                     gh.h_obs.data[k] *= self.params[i] * self.params[j]
 
             gh.g[self.n:] *= self.params[self.n:]
-
             gh.h_diag[self.n:] += gh.g[self.n:]
-
-
-            if np.any(gh.h_diag < 0):
+            
+            if any(gh.h_diag < 0):
                 raise RuntimeError("negative diagonal")
 
-            # condition by the diagonal
-            # todo, introduce Cholesky factorisation of the corner 2x2 matrix?
+            # Jacobi conditionning
+            # TODO: introduce Cholesky factorisation of the corner 2x2 matrix?
             sd = 1 / sqrt(gh.h_diag)
 
+            # Condition the Hessian. TODO: see if it's faster to just pass the conditionning matrix to the solver
             gh.h_diag *= sd * sd
-
-            gh.h_αβ *= np.outer(sd[-2:],sd[-2:])
+            gh.h_αβ *= outer(sd[-2:],sd[-2:])
             gh.h_μσ *= sd[self.n:-2]
-            gh.h_μσαβ *= np.outer(sd[:-2], sd[-2:])
-
+            gh.h_μσαβ *= outer(sd[:-2], sd[-2:])
             for (k, (i, j)) in enumerate(zip(gh.h_obs.row, gh.h_obs.col)):
                 gh.h_obs.data[k] *= sd[i] * sd[j]
 
             gh.g *= sd
-            H = np.array([gh.h.dot(c) for c in np.eye(2*self.n+2, 2*self.n+2)])
-            print(condest(H))
-
-
-
-
+            
+            # H = array([gh.h.dot(c) for c in eye(2*self.n+2, 2*self.n+2)])
+            # print(condest(H))
 
             while True:
-                try:
-                    # κ = np.linalg.cond(gh.h + np.diag(np.diag(gh.h) * (1 + λ)))
-                    # κstats.append(κ)
-
-                    # diff =  sd * linalg.solve(gh.h + np.diag(np.diag(gh.h) * (1 + λ)), gh.g, assume_a='sym')
-                    # solve with sparse.linalg.cg
+                try:                
                     gh.h_diag *= (1 + λ)
                     diff = sd * cg(gh.h, gh.g, tol=1e-8, atol=1e-12)[0]
                     gh.h_diag /= (1 + λ)
@@ -487,32 +565,13 @@ class VBayes():
 
                     else:
                         self.params = old_params
-                        λ *= 10 # otherwise increase the conditioning
-                        #if verbose:
-                        #    print(f"λ->{λ} because overshoot")
+                        λ *= 10 # otherwise increase the conditioning                        
 
                 except RuntimeWarning as r:
                     λ *= 10
-                    #if verbose:
-                    #    print(f"λ->{λ} because warning")
 
             if verbose:
-                print(gh.val, (self.σ()**2).mean() ) # , "KL~", self.KL(obs))
-
-        # print some stats regarding κ, such as mean, standard deviation, and various percentiles
-        # κstats = np.array(κstats)
-        # print("κ stats:")
-        # print("mean:", κstats.mean())
-        # print("std:", κstats.std())
-        # print("min:", κstats.min())
-        # print("max:", κstats.max())
-        # print("25%:", np.percentile(κstats, 25))
-        # print("50%:", np.percentile(κstats, 50))
-        # print("75%:", np.percentile(κstats, 75))
-        # print("90%:", np.percentile(κstats, 90))
-        # print("95%:", np.percentile(κstats, 95))
-        # print("99%:", np.percentile(κstats, 99))
-        # print("99.9%:", np.percentile(κstats, 99.9))
+                print(gh.val)
         return
 
 
@@ -542,7 +601,7 @@ class VBayes():
 
             # 95% interval
             interval = 1.96 * sqrt(var / (i + 1))
-            if np.abs(interval / mean) < accuracy_goal and i > 100:
+            if abs(interval / mean) < accuracy_goal and i > 100:
                 return (mean - interval, mean + interval)
         return (mean - interval, mean + interval)
 
@@ -593,15 +652,15 @@ class VBayes():
     def best_pair(self, obs, target='expected_inversions', verify_top=0, possible_pairs=None):
 
         self.fit(verbose=False, obs=obs)
-        dobs = np.zeros((self.n, self.n, 2))
+        dobs = zeros((self.n, self.n, 2))
         gh = self.eval(obs,compute_gradient=True,compute_hessian=True, dobs=dobs)
 
         targets = ['expected_inversions', 'sum_of_variances']
         match target:
             case 'sum_of_variances':
-                df_dparam = np.concatenate([np.zeros(self.n), 2 * self.σ(), np.zeros(2)])
+                df_dparam = concatenate([zeros(self.n), 2 * self.σ(), zeros(2)])
             case 'expected_inversions':
-                df_dparam = np.zeros(2 * self.n + 2)
+                df_dparam = zeros(2 * self.n + 2)
                 _ = self.expected_inversions(gradient=df_dparam)
             case _:
                 raise ValueError(f"target must be one of {targets}")
@@ -618,22 +677,22 @@ class VBayes():
             p = self.prob_win(i, j)
 
             gain = p * ifwin + (1 - p) * iflose
-            gains.append(np.array([gain, i, j]))
+            gains.append(array([gain, i, j]))
 
-        gains = np.array(gains)
-        gains = gains[np.lexsort(gains.T[::-1])]
+        gains = array(gains)
+        gains = gains[lexsort(gains.T[::-1])]
 
         einv = self.expected_inversions()
-        real_gains = np.zeros(gains.shape)
+        real_gains = zeros(gains.shape)
         k = 0
         for i, j in possible_pairs:
             print(k/len(possible_pairs))
             # i, j = round(gains[k,1]), round(gains[k,2])
             old_params = self.params.copy()
 
-            obs.data = np.append(obs.data, 1)
-            obs.row = np.append(obs.row, i)
-            obs.col = np.append(obs.col, j)
+            obs.data = append(obs.data, 1)
+            obs.row = append(obs.row, i)
+            obs.col = append(obs.col, j)
 
             self.fit(verbose=False, obs=obs, tol=1e-6)
             win = self.expected_inversions()
@@ -652,7 +711,7 @@ class VBayes():
             real_gains[k,2] = j
             k = k + 1
 
-        gains = gains[np.lexsort(gains.T[::-1])]
+        gains = gains[lexsort(gains.T[::-1])]
         return gains
 
 
