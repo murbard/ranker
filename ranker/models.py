@@ -8,7 +8,7 @@ import numpy as np
 from scipy import linalg
 from scipy.optimize import minimize
 from matplotlib import pyplot as plt
-from utils import condest
+# from .utils import condest
 
 import warnings
 warnings.filterwarnings("error")
@@ -23,10 +23,7 @@ except ImportError:
 def almost_log_expit(x):
     return - 2 * exp(- π * x**2 / 16) / π + x / 2 * erfc(sqrt(π) * x / 4)
 
-
 rng = np.random.default_rng(12345)
-
-# This file has all the docstrings required by Sphinx to generate the documentation.
 
 """
 This module contains the Model, VBayes, Instance, and GradientHessian classes.
@@ -99,8 +96,8 @@ class Model():
         :param instance: an instance of the model
         :param obs: an array of observed data
         :param expit_approx: whether to use the approximation of the logit function
-        """        
-         
+        """
+
         if expit_approx:
             expit_val = almost_log_expit(array([instance.z[o[0]] - instance.z[o[1]] for o in obs])).sum()
         else:
@@ -147,14 +144,14 @@ class Instance():
                     obs[j, i] = counts[k] - obs[i, j]
                 k += 1
         return coo_matrix(obs)
-    
+
     def match(self, i, j):
         """
-        Samples a match between items i and j from the instance.        
+        Samples a match between items i and j from the instance.
         :param i: the first item
         :param j: the second item
         """
-        p = expit(self.z[i] - self.z[j])        
+        p = expit(self.z[i] - self.z[j])
         return rng.rand() < expit(self.z[i] - self.z[j])
 
 
@@ -183,7 +180,7 @@ class GradientHessian():
         """
         Computes the matrix-vector product of the hessian with a vector.
         :param x: the vector to multiply with
-        """        
+        """
         res =  self.h_diag * x
         res[-2:] += (self.h_αβ + self.h_αβ.T) @ (x[-2:])
         res[:-2] += self.h_μσαβ @ x[-2:]
@@ -194,7 +191,7 @@ class GradientHessian():
     def gα(self):
         """
         Getter and setter for the gradient term corresponding to α.
-        """        
+        """
         return self.g[-2:-1]
 
     def gβ(self):
@@ -206,13 +203,13 @@ class GradientHessian():
     def gμ(self):
         """
         Getter and setter for the gradient term corresponding to μ.
-        """        
+        """
         return self.g[:self.n]
 
     def gσ(self):
         """
         Getter and setter for the gradient term corresponding to σ.
-        """        
+        """
         return self.g[self.n:2*self.n]
 
     def nans_in_grad(self):
@@ -236,7 +233,7 @@ class VBayes():
 
     def __init__(self, model):
         """
-        Constructs a class for performing variational bayes on a model.        
+        Constructs a class for performing variational bayes on a model.
         """
         self.model = model
 
@@ -273,7 +270,7 @@ class VBayes():
     def α(self):
         """
         Getter and setter for the shape parameter of the posterior of the variance.
-        """        
+        """
         return self.params[2*self.n : 2*self.n + 1]
 
     def β(self):
@@ -490,7 +487,6 @@ class VBayes():
                     gh.h_obs.col[k] = n + j
                     k += 1
 
-
         if compute_gradient and gh.nans_in_grad():
             raise ValueError("NaN in gradient")
         if compute_hessian and gh.nans_in_hess():
@@ -498,27 +494,28 @@ class VBayes():
         return gh
 
 
-    def fit(self, obs, niter=100000, tol=1e-8, verbose=True, λ0 = 1e-10):
+    def fit(self, obs, max_iter=100000, tol=1e-8, verbose=True, λ0 = 1e-10, λmax = 10000):
         """
-        Fit the model to the observed data.        
-        Uses a Newton-CG algorithm to find the maximum a posteriori estimate of the parameters.        
+        Fit the model to the observed data.
+        Uses a Newton-CG algorithm to find the maximum a posteriori estimate of the parameters.
         """
-        
+
         last_val = None
-        for _ in range(niter):
+        for _ in range(max_iter):
             λ = λ0
             gh = self.eval(obs, compute_gradient=True, compute_hessian=True)
-            # don't stop if we're still dampening the hessian, but do stop if it's gone too far                
-            if last_val and abs(last_val - gh.val)/abs(gh.val) < tol and λ == λ0 or λ > 10000: 
+            # don't stop if we're still dampening the hessian, but do stop if it's gone too far
+            if last_val and abs(last_val - gh.val)/abs(gh.val) < tol and λ == λ0 or λ > λmax:
                 break
             last_val = gh.val
 
             # Newton update for the log of positive parameters
-            # For that we modify the gradient and the Hessian            
+            # For that we modify the gradient and the Hessian
             gh.h_diag[self.n:] *= self.params[self.n:]**2
             gh.h_αβ *= outer(self.params[-2:], self.params[-2:])
             gh.h_μσ *= self.params[self.n:-2]
             gh.h_μσαβ[self.n:] *= outer(self.params[self.n:-2], self.params[-2:])
+            gh.h_μσαβ[:self.n] *= self.params[-2:]
 
             for (k, (i, j)) in enumerate(zip(gh.h_obs.row, gh.h_obs.col)):
                 if i >= self.n and j >= self.n:
@@ -526,7 +523,7 @@ class VBayes():
 
             gh.g[self.n:] *= self.params[self.n:]
             gh.h_diag[self.n:] += gh.g[self.n:]
-            
+
             if any(gh.h_diag < 0):
                 raise RuntimeError("negative diagonal")
 
@@ -541,14 +538,10 @@ class VBayes():
             gh.h_μσαβ *= outer(sd[:-2], sd[-2:])
             for (k, (i, j)) in enumerate(zip(gh.h_obs.row, gh.h_obs.col)):
                 gh.h_obs.data[k] *= sd[i] * sd[j]
-
             gh.g *= sd
-            
-            # H = array([gh.h.dot(c) for c in eye(2*self.n+2, 2*self.n+2)])
-            # print(condest(H))
 
             while True:
-                try:                
+                try:
                     gh.h_diag *= (1 + λ)
                     diff = sd * cg(gh.h, gh.g, tol=1e-8, atol=1e-12)[0]
                     gh.h_diag /= (1 + λ)
@@ -565,9 +558,9 @@ class VBayes():
 
                     else:
                         self.params = old_params
-                        λ *= 10 # otherwise increase the conditioning                        
+                        λ *= 10 # otherwise increase the conditioning
 
-                except RuntimeWarning as r:
+                except RuntimeWarning:
                     λ *= 10
 
             if verbose:
@@ -576,17 +569,25 @@ class VBayes():
 
 
     def prob_win(self, i, j):
-        # Compute the probability that player i beats player j
+        """
+        Probability that player i wins against player j
+        """
+        # Compute the probability that plfyer i beats player j
         μ = self.µ()[i] - self.µ()[j]
         σ = sqrt(self.σ()[i]**2 + self.σ()[j]**2)
         return 1/2 * (1 + erf(sqrt(π) * μ / (4 * sqrt(1 + π * σ**2 / 8))))
 
 
     def v95(self):
+        """
+        95% confidence interval for the variance v
+        """
         return sqrt(invgamma(self.α()[0], scale=1/self.β()[0]).interval(0.95))
 
     def KL(self, obs, max_iter=2000, accuracy_goal=1e-6):
-        # Compute the KL divergence between the approximate posterior and the true posterior using monte carlo sampling
+        """
+        Compute the KL divergence between the approximate posterior and the true posterior using Monte Carlo sampling
+        """
 
         cum_sum, cum_sum2 = 0, 0
         for i in range(max_iter):
@@ -612,9 +613,11 @@ class VBayes():
         return self.__str__()
 
     def expected_inversions(self, gradient=None):
+        """
+        Compute the expected number of inversions in the ranking
+        """
         μ = self.μ()
         σ = self.σ()
-
 
         # Compute the expected number of inversions in the approximate posterior
         inversions = 0
@@ -622,6 +625,8 @@ class VBayes():
             for j in range(i+1, self.n):
                 σδ = sqrt(σ[i]**2 + σ[j]**2)
                 μδ = μ[i] - μ[j]
+                # We would use the sign of μ[i] - μ[j] to give us the order,
+                # so to look at the probability that they are out of order, we take the absolute value
                 z = abs(μδ) / σδ
 
                 # inverse normal cdf of z
@@ -640,6 +645,10 @@ class VBayes():
         return inversions
 
     def actual_inversions(self, instance):
+        """
+        Compute the actual number of inversions in the ranking, given an instance
+        """
+
         μ = self.μ()
         inversions = 0
         for i in range(self.n):
@@ -650,6 +659,15 @@ class VBayes():
 
 
     def best_pair(self, obs, target='expected_inversions', verify_top=0, possible_pairs=None):
+        """
+        Find the pair of players that would most improve the approximation if matched up against each other.
+        :param obs: the observations
+        :param target: the target function to optimize, can be 'expected_inversions', or 'variance', or 'entropy'
+        :param verify_top: if > 0, take the top verify_top pairs and compute the metric by simulating the observation instead of just using the gradient
+        :param possible_pairs: if not None, only consider these pairs
+        """
+
+        #TODO: consider using a tree search
 
         self.fit(verbose=False, obs=obs)
         dobs = zeros((self.n, self.n, 2))
@@ -739,8 +757,6 @@ def test():
 
     plt.show()
 
-test()
-
 
 
 
@@ -758,4 +774,12 @@ if __name__ == '__main__':
     # lp_wrapper = lp(test)
     # lp_wrapper()
     # lp.print_stats()
-    test()
+    # test()
+    vbayes = VBayes(Model(n=3))
+    vbayes.params = array([0.1, -0.2, 0.3, 1.1, 2.2, 3.3, 1.5, 3.0 ])
+    instance = vbayes.model.rvs()
+    gh = vbayes.eval(instance.observe(0), compute_gradient=True, compute_hessian=True)
+    print(gh.val)
+    # gh.g[3:] *= vbayes.params[3:]
+    vbayes.fit(obs=instance.observe(0))
+    print(gh.g)
