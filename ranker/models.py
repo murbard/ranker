@@ -397,6 +397,13 @@ class VBayes():
         # the derivative wrt μ is:  - 1/2 erfc(μ / h)
         # the derivative wrt σ is:  exp(-(μ/h)²) σ / (√π h)
 
+        # note that we could also reinterpret those in the "logistic world"
+        # in thise case we woul write:
+        # the derivative wrt μ as: 1/2 (-1 + tanh(μ / √(4  + π σ² / 2)))
+        # the derivative wrt σ as: σ / (16 + 2 π σ²) sech(μ √(π / (16 + 2 π σ²)))²
+        # this is achieved by matching derivatives at μ = 0
+        # todo: try to see if it makes things better
+
         # note: if f(a,b) = g(c(a,b)) then
         # d²f/dadb = d²g/dc² (dc/da)(dc/db) + dg/dc d²c/(da db)
 
@@ -518,8 +525,10 @@ class VBayes():
             gh.h_μσαβ[:self.n] *= self.params[-2:]
 
             for (k, (i, j)) in enumerate(zip(gh.h_obs.row, gh.h_obs.col)):
-                if i >= self.n and j >= self.n:
-                    gh.h_obs.data[k] *= self.params[i] * self.params[j]
+                if i >= self.n:
+                    gh.h_obs.data[k] *= self.params[i]
+                if j >= self.n:
+                    gh.h_obs.data[k] *= self.params[j]
 
             gh.g[self.n:] *= self.params[self.n:]
             gh.h_diag[self.n:] += gh.g[self.n:]
@@ -781,5 +790,11 @@ if __name__ == '__main__':
     gh = vbayes.eval(instance.observe(0), compute_gradient=True, compute_hessian=True)
     print(gh.val)
     # gh.g[3:] *= vbayes.params[3:]
-    vbayes.fit(obs=instance.observe(0))
+    obs = zeros((3,3))
+    obs[0,2] = 2
+    obs[1,2] = 2
+    obs[2,0] = 3
+    obs[1,0] = 1
+    obs = coo_matrix(obs)
+    vbayes.fit(obs=obs)
     print(gh.g)

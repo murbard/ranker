@@ -9,18 +9,18 @@
 #include <math.h>
 #include <stdlib.h>
 
-#define M_α 1.2
-#define M_β 2.0
-#define M_lnβ 0.693147180559945309
-#define M_lnΓ_β 0.0
-#define M_lnΓ_α -0.0853740900033158
 
+// Comments for doc generation
 
+/// @brief Intance of a ranker problem
+/// @details This structure contains all the hidden information describing a ranker problem
 typedef struct {
     double v;
     gsl_vector *z;
 } instance;
 
+/// @brief Solution of a ranker problem
+/// @details This structure contains all the information describing a solution of a ranker problem
 typedef struct {
     int n;
     double ln_α;
@@ -40,8 +40,10 @@ typedef struct {
     gsl_vector *μσαβ; // 2n vector representing a 2n by 2 matrix where columns are identical
 } hessian;
 
-
-hessian * hessian_alloc(int n) {
+/// @brief Allocate a hessian structure
+/// @param n Dimension of the problem
+/// @return A pointer to the allocated structure
+hessian * hessian_alloc(const int n) {
     hessian *h = (hessian*)malloc(sizeof(hessian));
     h->obs = gsl_spmatrix_alloc(2 * n, 2 * n);
     h->diag = gsl_vector_alloc(2 * n + 2);
@@ -49,47 +51,187 @@ hessian * hessian_alloc(int n) {
     return h;
 }
 
-void hessian_free(hessian *h) {
+/// @brief Free a hessian structure
+/// @param h A pointer to the structure to free
+void hessian_free(hessian * const h) {
     gsl_spmatrix_free(h->obs);
     gsl_vector_free(h->diag);
     gsl_vector_free(h->μσαβ);
     free(h);
 }
 
-
-void hessian_dot(hessian h, gsl_vector* x, gsl_vector* out) {
+/// @brief Computes the matrix product of a hessian structure with a vector
+/// @param h A pointer to the hessian structure
+/// @param x A pointer to the vector
+/// @param out A pointer to the vector where the result will be stored
+void hessian_dot(const hessian* const h, const gsl_vector* const x, gsl_vector* const out) {
     int n = (x->size - 2)/2;
     // the dimensions are 2 * n + 2
 
     // view of diag, x, and out, excluding last two elements, called diag_μσ, x_μσ, and out_μσ
-    gsl_vector_view diag_μσ = gsl_vector_subvector(h.diag, 0, 2 * n);
-    gsl_vector_view x_μσ = gsl_vector_subvector(x, 0, 2 * n);
+    gsl_vector_const_view diag_μσ = gsl_vector_const_subvector(h->diag, 0, 2 * n);
+    gsl_vector_const_view x_μσ = gsl_vector_const_subvector(x, 0, 2 * n);
     gsl_vector_view out_μσ = gsl_vector_subvector(out, 0, 2 * n);
 
     // out_μσ = diag_μσ * x_μσ + μσαβ * (x[2 * n] + x[2 * n + 1])
     gsl_vector_memcpy(&out_μσ.vector, &diag_μσ.vector);
     gsl_vector_mul(&out_μσ.vector, &x_μσ.vector);
-    gsl_blas_daxpy(x->data[2 * n] + x->data[2 * n + 1], h.μσαβ, &out_μσ.vector);
+    gsl_blas_daxpy(x->data[2 * n] + x->data[2 * n + 1], h->μσαβ, &out_μσ.vector);
 
     // out[2 * n] = μσαβ . x_μσ + diag[2 * n] * x[2 * n] + αβ * x[2 * n + 1]
     // out[2 * n + 1] = μσαβ . x_μσ + diag[2 * n + 1] * x[2 * n + 1] + αβ * x[2 * n]
     double μσαβx;
-    gsl_blas_ddot(h.μσαβ, &x_μσ.vector, &μσαβx);
-    out->data[2 * n] = μσαβx + h.diag->data[2 * n] * x->data[2 * n] + h.αβ * x->data[2 * n + 1];
-    out->data[2 * n + 1] = μσαβx + h.αβ * x->data[2 * n] + h.diag->data[2 * n + 1] * x->data[2 * n + 1];
+    gsl_blas_ddot(h->μσαβ, &x_μσ.vector, &μσαβx);
+    out->data[2 * n] = μσαβx + h->diag->data[2 * n] * x->data[2 * n] + h->αβ * x->data[2 * n + 1];
+    out->data[2 * n + 1] = μσαβx + h->αβ * x->data[2 * n] + h->diag->data[2 * n + 1] * x->data[2 * n + 1];
 
     // out[:-2] += h.obs @ x[:-2] + h.obs.T @ x[:-2]
     // remember that out is a sparse upper triangular matrix representing a symmetric matrix
-    gsl_spblas_dgemv(CblasNoTrans, 1.0, h.obs, &x_μσ.vector, 1.0, &out_μσ.vector);
-    gsl_spblas_dgemv(CblasTrans, 1.0, h.obs, &x_μσ.vector, 1.0, &out_μσ.vector);
+    gsl_spblas_dgemv(CblasNoTrans, 1.0, h->obs, &x_μσ.vector, 1.0, &out_μσ.vector);
+    gsl_spblas_dgemv(CblasTrans, 1.0, h->obs, &x_μσ.vector, 1.0, &out_μσ.vector);
     return ;
 }
 
-double evaluate(ranker ranker, observations obs, gsl_vector *gradient, hessian *hessian, gsl_matrix *dobs) {
-    const int n = ranker.n;
 
+void hessian_to_dense(const hessian* const h, const gsl_matrix* dense) {
+    int n = (h->diag->size - 2)/2;
+    // fill the diagonal
+    for (int i = 0; i < 2 * n + 2; i++) {
+        dense->data[i * (2 * n + 2) + i] = h->diag->data[i];
+
+    }
+    // fill the off-diagonal
+    for (int i = 0; i < 2 * n; i++) {
+        for (int j = i + 1; j < 2  * n; j++) {
+            dense->data[i * (2 * n + 2) + j] += gsl_spmatrix_get(h->obs, i, j);
+            dense->data[j * (2 * n + 2) + i] += gsl_spmatrix_get(h->obs, i, j);
+        }
+    }
+    // fill in the αβ and βα terms
+    dense->data[2 * n * (2 * n + 2) + 2 * n + 1] += h->αβ;
+    dense->data[(2 * n + 1) * (2 * n + 2) + 2 * n] += h->αβ;
+
+    // fill in the μσαβ and αβμσ terms
+    for (int i = 0; i < 2 * n; i++) {
+        dense->data[i * (2 * n + 2) + 2 * n] += h->μσαβ->data[i];
+        dense->data[i * (2 * n + 2) + 2 * n + 1] += h->μσαβ->data[i];
+        dense->data[2 * n * (2 * n + 2) + i] += h->μσαβ->data[i];
+        dense->data[(2 * n + 1) * (2 * n + 2) + i] += h->μσαβ->data[i];
+    }
+}
+
+void print_hessian(const hessian* const h) {
+    int n = (h->diag->size - 2)/2;
+    gsl_matrix *dense = gsl_matrix_alloc(2 * n + 2, 2 * n + 2);
+    hessian_to_dense(h, dense);
+    gsl_matrix_fprintf(stdout, dense, "%g");
+    // print in the Mathematica format on one line, i.e. {{...}, {...}, ...}
+    printf("{");
+    for (int i = 0; i < 2 * n + 2; i++) {
+        printf("{");
+        for (int j = 0; j < 2 * n + 2; j++) {
+            printf("%g", dense->data[i * (2 * n + 2) + j]);
+            if (j < 2 * n + 1) {
+                printf(", ");
+            }
+        }
+        printf("}");
+        if (i < 2 * n + 1) {
+            printf(", ");
+        }
+    }
+    printf("}\n");
+    gsl_matrix_free(dense);
+}
+
+// Solve H * x = y for x using the conjugate gradient method with Jacobi preconditioning
+void cg(const hessian * const hessian, const gsl_vector * const y, gsl_vector * const x, double tol, int max_iter) {
+
+    // initialize x to 0
+    gsl_vector_set_zero(x);
+
+    gsl_vector *r0 = gsl_vector_alloc(y->size);
+    // r0 = y - H * x0 but x0 = 0
+    gsl_vector_memcpy(r0, y);
+
+    //hessian_dot(hessian, x, r0);
+    //gsl_vector_sub(r0, y);
+    //gsl_vector_scale(r0, -1.0);
+
+    gsl_vector *z0 = gsl_vector_alloc(y->size);
+    // g0 = M^-1 * r0 with Jacobi conditionning (i.e. M is the diagonal of H)
+    gsl_vector_memcpy(z0, r0);
+    gsl_vector_div(z0, hessian->diag);
+
+    // p0 = z0
+    gsl_vector *p0 = gsl_vector_alloc(y->size);
+    gsl_vector_memcpy(p0, z0);
+
+    int k = 0;
+    gsl_vector *Hp = gsl_vector_alloc(y->size);
+    gsl_vector *x1 = gsl_vector_alloc(y->size);
+    gsl_vector *r1 = gsl_vector_alloc(y->size);
+    gsl_vector *p1 = gsl_vector_alloc(y->size);
+    gsl_vector *z1 = gsl_vector_alloc(y->size);
+
+
+    gsl_vector* r_[] = {r0, r1};
+    gsl_vector* p_[] = {p0, p1};
+    gsl_vector* z_[] = {z0, z1};
+
+    while (k < max_iter) {
+
+        double rkTzk, pkTHpk;
+        gsl_blas_ddot(r_[k&1], z_[k&1], &rkTzk);
+        hessian_dot(hessian, p_[k&1], Hp);
+        gsl_blas_ddot(p_[k&1], Hp, &pkTHpk);
+        // αk = (rk . zk) / (pk . H . pk);
+        double αk = rkTzk / pkTHpk;
+        // xk+1 = xk + αk * pk
+        gsl_blas_daxpy(αk, p_[k&1], x);
+        // rk+1 = rk - αk * H * pk
+        gsl_vector_memcpy(r_[(k+1)&1], r_[k&1]);
+        gsl_blas_daxpy(-αk, Hp, r_[(k+1)&1]);
+        // if r1 is sufficiently small, we are done, return x[k+1]
+        // for debug print the norm of r[k+1]
+        double norm_rk1 = gsl_blas_dnrm2(r_[(k+1)&1]);
+        printf("norm of r = %lf\n", norm_rk1);
+        // flush stdout
+        fflush(stdout);
+
+        if (gsl_blas_dnrm2(r_[(k+1)&1]) < tol)
+            break;
+
+        // zk1 = M^-1 * rk1 with Jacobi conditionning (i.e. M is the diagonal of H)
+        gsl_vector_memcpy(z_[(k+1)&1], r_[(k+1)&1]);
+        gsl_vector_div(z_[(k+1)&1], hessian->diag);
+
+        // βk = (r1 . r1) / (r0 . r0)
+        double rk1Tzk1;
+        gsl_blas_ddot(r_[(k+1)&1], z_[(k+1)&1], &rk1Tzk1);
+        double βk = rk1Tzk1 / rkTzk;
+        // p1 = r1 + βk * p0
+        gsl_vector_memcpy(p_[(k+1)&1], z_[(k+1)&1]);
+        gsl_blas_daxpy(βk, p_[k&1], p_[(k+1)&1]);
+        k = k + 1;
+    }
+    free(r0); free(r1); free(p0); free(p1); free(z0); free(z1); free(Hp);
+}
+
+/// @brief Evaluate the ELBO objective function
+/// @details Evaluate the ELBO objective function for a given ranker problem and observations.
+/// If gradient or hessian are not NULL, compute the gradient and/or the hessian. If dobs is not NULL
+/// compute the derivative of the parameters with respect to the observations.
+/// @param ranker A pointer to the ranker structure
+/// @param obs A pointer to the observations structure
+/// @param gradient A pointer to the vector where the gradient will be stored
+/// @param hessian A pointer to the hessian structure where the hessian will be stored
+/// @param dobs A pointer to the vector where the derivative of the parameters with respect to the observations will be stored
+/// @return The value of the ELBO objective function
+double evaluate(const ranker ranker, const observations obs, gsl_vector * const gradient, hessian * const hessian, gsl_matrix * const dobs) {
 
     // Set some constants for easy access
+    const int n = ranker.n;
     const double α = exp(ranker.ln_α);
     const double β = exp(ranker.ln_β);
     const double ln_β = ranker.ln_β;
@@ -113,12 +255,10 @@ double evaluate(ranker ranker, observations obs, gsl_vector *gradient, hessian *
         Σ_lnσ += lnσi;
     }
 
-    const double Mβ = 2.0;
+    const double Mβ = 2.0; // todo move to global and precompute other constants
     const double Mα = 1.2;
 
-
     // First the terms that do not depend on observations
-
     double v = - α + αβ / Mβ + Mα * log(Mβ) - 0.5 * n * (1 + log(2 * M_PI)) +
      ln_β + gsl_sf_lngamma(Mα) - gsl_sf_lngamma(α) + (α - Mα) * psi_α - (1 + Mα) * ln_β
      - Σ_lnσ + 0.5 * (αβ * Σ_μ2_σ2  - n * (ln_β + psi_α - log(2 * M_PI)));
@@ -193,7 +333,7 @@ double evaluate(ranker ranker, observations obs, gsl_vector *gradient, hessian *
         double gμδ = - 0.5 * (1 - erf(μδ_over_h));
         double gσδ = - exp_minus_μδ_over_h_square * σδ / sqrt_π_h;
 
-        v += count * (exp_minus_μδ_over_h_square * h / (2 * sqrt(M_PI)) - 0.5 * μδ * gμδ);
+        v += count * (exp_minus_μδ_over_h_square * h / (2 * sqrt(M_PI)) + μδ * gμδ);
 
         if (gradient != NULL) {
             // Compute gradient
@@ -228,20 +368,33 @@ double evaluate(ranker ranker, observations obs, gsl_vector *gradient, hessian *
             int col = GSL_MAX(i, j);
             // there are 6 entries in the sparse matrix, hμiμj, hμiσi, hμiσj, hμjσi, hμjσj, hσiσj
 
+            // TODO: do not represent obs with a sparse matrix, we do not need to perform
+            // algebra on it. That way we can iterate over all matches and now both the number
+            // of wins and losses, so we can set the hessian terms once without having to
+            // query them to add or subtract. Alternatively, we could use a complex sparse
+            // matrix to store the number of wins and losses in the real and imaginary part
+
             // hμiμj
-            gsl_spmatrix_set(hessian->obs, row, col, count * hμμδ);
+            double before = gsl_spmatrix_get(hessian->obs, row, col);
+            gsl_spmatrix_set(hessian->obs, row, col, before + count * hμμδ);
+
             // hμiσi, hμjσi
             double chσ = count * hμσδ * σ2->data[i] / σδ;
-            gsl_spmatrix_set(hessian->obs, i, n + i, - chσ);
-            gsl_spmatrix_set(hessian->obs, j, n + i, chσ);
+            before = gsl_spmatrix_get(hessian->obs, i,  n + i);
+            gsl_spmatrix_set(hessian->obs, i, n + i, before - chσ);
+            before = gsl_spmatrix_get(hessian->obs, j,  n + i);
+            gsl_spmatrix_set(hessian->obs, j, n + i, before + chσ);
 
             // hμiσj, hμjσj
             chσ = count * hμσδ * σ2->data[j] / σδ;
-            gsl_spmatrix_set(hessian->obs, i, n + j, - chσ);
-            gsl_spmatrix_set(hessian->obs, j, n + j, chσ);
+            before = gsl_spmatrix_get(hessian->obs, i,  n + j);
+            gsl_spmatrix_set(hessian->obs, i, n + j, before - chσ);
+            before = gsl_spmatrix_get(hessian->obs, j, n + j);
+            gsl_spmatrix_set(hessian->obs, j, n + j, before + chσ);
 
             // hσiσj
-            gsl_spmatrix_set(hessian->obs, n + row, n + col, - count * (σ2->data[i] * σ2->data[j] / (σδ * σδ) * (hσσδ - gσδ / σδ)));
+            before =  gsl_spmatrix_get(hessian->obs, n + row, n + col);
+            gsl_spmatrix_set(hessian->obs, n + row, n + col, before - count * (σ2->data[i] * σ2->data[j] / (σδ * σδ) * (hσσδ - gσδ / σδ)));
         }
     }
     return v;
@@ -271,6 +424,12 @@ int main() {
     observations obs;
     obs.X = gsl_spmatrix_alloc(1, 1);
 
+    gsl_spmatrix_set(obs.X, 0, 2, 2.0);
+    gsl_spmatrix_set(obs.X, 1, 2, 2.0);
+    gsl_spmatrix_set(obs.X, 2, 0, 3.0);
+    gsl_spmatrix_set(obs.X, 1, 0, 1.0);
+
+
     gsl_vector * g = gsl_vector_calloc(2 * n + 2);
     hessian * h = hessian_alloc(n);
 
@@ -287,7 +446,35 @@ int main() {
     for(int i = 0; i < 2 * n; ++i) {
         printf("μσαβ: %lf\n", h->μσαβ->data[i]);
     }
+    for(int k = 0; k < h->obs->nz; ++k) {
+        printf("obs: (%d, %d) -> %lf\n", h->obs->i[k], h->obs->p[k], h->obs->data[k]);
+    }
+
+    // print hessian with dedicated function
+    print_hessian(h);
+
+
+
+    // cg with Hessian and gradient
+    gsl_vector * dx = gsl_vector_calloc(2 * n + 2);
+    cg(h, g, dx, 1e-3, 1000);
+
+
+    // h dot dx
+    gsl_vector * hdx = gsl_vector_calloc(2 * n + 2);
+    hessian_dot(h, dx, hdx);
+    for(int i = 0; i < 2 * n + 2; ++i) {
+        printf("h dot dx, d: %lf, %lf\n", hdx->data[i], g->data[i]);
+    }
+
+    // print dx
+    for(int i = 0; i < 2 * n + 2; ++i) {
+        printf("dx: %lf\n", dx->data[i]);
+    }
+
+
 
 
     return 0;
+
 }
