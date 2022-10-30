@@ -9,6 +9,9 @@
 #include <math.h>
 #include <stdlib.h>
 
+const double Mβ = 2.0;
+const double Mα = 1.2;
+
 
 // Comments for doc generation
 
@@ -23,10 +26,7 @@ typedef struct {
 /// @details This structure contains all the information describing a solution of a ranker problem
 typedef struct {
     int n;
-    double ln_α;
-    double ln_β;
-    gsl_vector *μ; // dimension n
-    gsl_vector *ln_σ; // dimension n
+    gsl_vector * params ; // dimension 2 * n + 1
 } ranker;
 
 typedef struct {
@@ -58,6 +58,33 @@ void hessian_free(hessian * const h) {
     gsl_vector_free(h->diag);
     gsl_vector_free(h->μσαβ);
     free(h);
+}
+
+ranker * ranker_alloc(const int n) {
+    ranker *r = (ranker*)malloc(sizeof(ranker));
+    r->n = n;
+    r->params = gsl_vector_calloc(2 * n + 2);
+
+    /*
+        Given that the variance is picked from an inverse gamma distribution, the
+        posterior should be a student t distribution with 2 a degrees of freedom
+        and scaling factor √(b/a). We minimize the KL divergence between a normal
+        and that distribution by picking a standard deviation approximately equal to
+         √(b/a) (1 + 3 / (6 a + 2 a²))
+    */
+    double σ = sqrt(Mβ / Mα) * (1 + 3 / (6 * Mα + 2 * Mα * Mα));
+
+    gsl_vector_view σs = gsl_vector_subvector(r->params, n, n);
+    gsl_vector_set_all(&σs.vector, log(σ));
+    gsl_vector_set(r->params, 2 * n, log(Mα));
+    gsl_vector_set(r->params, 2 * n + 1, log(Mβ));
+
+    return r;
+}
+
+void ranker_free(ranker * const r) {
+    gsl_vector_free(r->params);
+    free(r);
 }
 
 /// @brief Computes the matrix product of a hessian structure with a vector
@@ -124,7 +151,7 @@ void print_hessian(const hessian* const h) {
     int n = (h->diag->size - 2)/2;
     gsl_matrix *dense = gsl_matrix_alloc(2 * n + 2, 2 * n + 2);
     hessian_to_dense(h, dense);
-    gsl_matrix_fprintf(stdout, dense, "%g");
+    //gsl_matrix_fprintf(stdout, dense, "%g");
     // print in the Mathematica format on one line, i.e. {{...}, {...}, ...}
     printf("{");
     for (int i = 0; i < 2 * n + 2; i++) {
@@ -145,7 +172,7 @@ void print_hessian(const hessian* const h) {
 }
 
 // Solve H * x = y for x using the conjugate gradient method with Jacobi preconditioning
-void cg(const hessian * const hessian, const gsl_vector * const y, gsl_vector * const x, double tol, int max_iter) {
+void cg(const hessian * const hessian, const gsl_vector * const y, gsl_vector * const x,  double λ, double tol, int max_iter) {
 
     // initialize x to 0
     gsl_vector_set_zero(x);
@@ -162,6 +189,7 @@ void cg(const hessian * const hessian, const gsl_vector * const y, gsl_vector * 
     // g0 = M^-1 * r0 with Jacobi conditionning (i.e. M is the diagonal of H)
     gsl_vector_memcpy(z0, r0);
     gsl_vector_div(z0, hessian->diag);
+    gsl_vector_scale(z0, 1.0 / (1.0 + λ));
 
     // p0 = z0
     gsl_vector *p0 = gsl_vector_alloc(y->size);
@@ -178,12 +206,20 @@ void cg(const hessian * const hessian, const gsl_vector * const y, gsl_vector * 
     gsl_vector* r_[] = {r0, r1};
     gsl_vector* p_[] = {p0, p1};
     gsl_vector* z_[] = {z0, z1};
+    gsl_vector* tmp = gsl_vector_alloc(y->size);
 
     while (k < max_iter) {
 
         double rkTzk, pkTHpk;
         gsl_blas_ddot(r_[k&1], z_[k&1], &rkTzk);
+        // add (1 + λ) * hessian->diag . p to Hp
+
+        gsl_vector_memcpy(tmp, p_[k&1]);
+        gsl_vector_mul(tmp, hessian->diag);
+        gsl_vector_scale(tmp, λ);
         hessian_dot(hessian, p_[k&1], Hp);
+        gsl_vector_add(Hp, tmp);
+
         gsl_blas_ddot(p_[k&1], Hp, &pkTHpk);
         // αk = (rk . zk) / (pk . H . pk);
         double αk = rkTzk / pkTHpk;
@@ -195,7 +231,7 @@ void cg(const hessian * const hessian, const gsl_vector * const y, gsl_vector * 
         // if r1 is sufficiently small, we are done, return x[k+1]
         // for debug print the norm of r[k+1]
         double norm_rk1 = gsl_blas_dnrm2(r_[(k+1)&1]);
-        printf("norm of r = %lf\n", norm_rk1);
+        //printf("%d: norm of r = %lf\n", k, norm_rk1);
         // flush stdout
         fflush(stdout);
 
@@ -205,6 +241,7 @@ void cg(const hessian * const hessian, const gsl_vector * const y, gsl_vector * 
         // zk1 = M^-1 * rk1 with Jacobi conditionning (i.e. M is the diagonal of H)
         gsl_vector_memcpy(z_[(k+1)&1], r_[(k+1)&1]);
         gsl_vector_div(z_[(k+1)&1], hessian->diag);
+        gsl_vector_scale(z_[(k+1)&1], 1.0 / (1.0 + λ));
 
         // βk = (r1 . r1) / (r0 . r0)
         double rk1Tzk1;
@@ -232,13 +269,16 @@ double evaluate(const ranker ranker, const observations obs, gsl_vector * const 
 
     // Set some constants for easy access
     const int n = ranker.n;
-    const double α = exp(ranker.ln_α);
-    const double β = exp(ranker.ln_β);
-    const double ln_β = ranker.ln_β;
+    const double ln_α = gsl_vector_get(ranker.params, 2 * n);
+    const double ln_β = gsl_vector_get(ranker.params, 2 * n + 1);
+    const double α = exp(ln_α);
+    const double β = exp(ln_β);
     const double αβ = α * β;
     const double psi_α = gsl_sf_psi(α);
     const double psi1_α = gsl_sf_psi_1(α);
     const double psi2_α = gsl_sf_psi_n(2, α);
+    const gsl_vector_const_view μ = gsl_vector_const_subvector(ranker.params, 0, n);
+    const gsl_vector_const_view ln_σ = gsl_vector_const_subvector(ranker.params, n, n);
 
     gsl_vector *σ2 = gsl_vector_calloc(n);
 
@@ -246,8 +286,8 @@ double evaluate(const ranker ranker, const observations obs, gsl_vector * const 
     double Σ_μ2_σ2 = 0.0;
     double Σ_lnσ = 0.0;
     for(int i = 0; i < n; ++i) {
-        double μi = ranker.μ->data[i];
-        double lnσi = ranker.ln_σ->data[i];
+        double μi = μ.vector.data[i];
+        double lnσi = ln_σ.vector.data[i];
         double σi2 = exp(2 * lnσi);
         σ2->data[i] = σi2;
         double μi2 = μi * μi;
@@ -255,8 +295,7 @@ double evaluate(const ranker ranker, const observations obs, gsl_vector * const 
         Σ_lnσ += lnσi;
     }
 
-    const double Mβ = 2.0; // todo move to global and precompute other constants
-    const double Mα = 1.2;
+
 
     // First the terms that do not depend on observations
     double v = - α + αβ / Mβ + Mα * log(Mβ) - 0.5 * n * (1 + log(2 * M_PI)) +
@@ -273,7 +312,7 @@ double evaluate(const ranker ranker, const observations obs, gsl_vector * const 
         // set the first n elements of gh.g to αβ * ranker.μ using daxpy
         // get a view of the first n elements of gh.g
         gsl_vector_view g_μ = gsl_vector_subvector(gradient, 0, n);
-        gsl_blas_daxpy(αβ, ranker.μ, &g_μ.vector);
+        gsl_blas_daxpy(αβ, &μ.vector, &g_μ.vector);
         // set the elements n to 2n of gh.g to -1 + αβ * σ2
         gsl_vector_view g_σ = gsl_vector_subvector(gradient, n, n);
         gsl_vector_memcpy(&g_σ.vector, σ2);
@@ -306,7 +345,7 @@ double evaluate(const ranker ranker, const observations obs, gsl_vector * const 
         // d²v/d{μ|σ}id{α|β}
         // place vector ranker.μ as the first half of the gh.h.μσαβ vector
         gsl_vector_view αβ_μ = gsl_vector_subvector(hessian->μσαβ, 0, n);
-        gsl_vector_memcpy(&αβ_μ.vector, ranker.μ);
+        gsl_vector_memcpy(&αβ_μ.vector, &μ.vector);
         // place vector σ2 as the second half of the gh.h.μσαβ vector
         gsl_vector_view αβ_σ = gsl_vector_subvector(hessian->μσαβ, n, n);
         gsl_vector_memcpy(&αβ_σ.vector, σ2);
@@ -327,7 +366,7 @@ double evaluate(const ranker ranker, const observations obs, gsl_vector * const 
         double σδ = sqrt(σ2->data[i] + σ2->data[j]);
         double h = sqrt(16.0 / M_PI + 2 * σδ * σδ);
         double sqrt_π_h = sqrt(M_PI) * h;
-        double μδ = ranker.μ->data[i] - ranker.μ->data[j];
+        double μδ = μ.vector.data[i] - μ.vector.data[j];
         double μδ_over_h = μδ / h;
         double exp_minus_μδ_over_h_square = exp(-μδ_over_h * μδ_over_h);
         double gμδ = - 0.5 * (1 - erf(μδ_over_h));
@@ -400,26 +439,102 @@ double evaluate(const ranker ranker, const observations obs, gsl_vector * const 
     return v;
 }
 
+double fit(ranker ranker, const observations obs, const double tol, const int max_iter) {
+
+    int k = 0;
+    double v = 0;
+    double v_prev = 0;
+    double v_diff = 0;
+    gsl_vector * gradient = gsl_vector_alloc(2 * ranker.n + 2);
+    hessian * hessian = hessian_alloc(ranker.n);
+    gsl_vector * dx = gsl_vector_alloc(2 * ranker.n + 2);
+    gsl_vector * out = gsl_vector_alloc(2 * ranker.n + 2);
+    gsl_vector * save_params = gsl_vector_alloc(2 * ranker.n + 2);
+
+    while (k < max_iter) {
+        double λ = 1e-10;
+        while (true) {
+            v = evaluate(ranker, obs, gradient, hessian, NULL);
+            // test if the diagonal of the hessian is positive
+            bool positive = true;
+            for (int i = 0; i < 2 * ranker.n + 2; i++) {
+                if (hessian->diag->data[i] <= 0) {
+                    positive = false;
+                    break;
+                }
+            }
+            if (!positive) {
+                printf("ruhroh\n");
+            }
+
+            cg(hessian, gradient, dx,  λ, tol, 1000 * ranker.n );
+            gsl_vector_memcpy(save_params, ranker.params);
+            //gsl_vector_scale(dx, 0.1);
+            gsl_vector_sub(ranker.params, dx);
+            double v_new = evaluate(ranker, obs, NULL, NULL, NULL);
+
+            if (v_new < v) {
+                printf("v_new = %e < v = %e, λ = %e\n", v_new, v, λ);
+                break;
+            } else {
+                gsl_vector_memcpy(ranker.params, save_params);
+                λ *= 10;
+                if (λ > 1e300) {
+                    printf("giving up. gradient norm = %e\n", gsl_blas_dnrm2(gradient) );
+                    // print params
+                    for (int i = 0; i < 2 * ranker.n + 2; i++) {
+                        printf("params[%d] = %e\n", i, ranker.params->data[i]);
+                    }
+                    // pritn hessian using the function we wrote
+                    printf("hessian:\n");
+                    print_hessian(hessian);
+
+
+                    exit(-1);
+                }
+
+                // print λ, the double, in scientific notation
+                printf("λ = %e, v_new = %e, v = %e\n", λ, v_new, v);
+            }
+        }
+
+
+
+        // check gradient norm and stop if it is small enough
+        if (gsl_blas_dnrm2(gradient) < tol) {
+            break;
+        }
+        // subtract dx[0:n] from ranker.μ, subtract dx[n:2n] from ranker.ln_σ, subtract dx[2n] from ranker.ln_α, subtract dx[2n+1] from ranker.ln_β
+
+    }
+    gsl_vector_free(gradient);
+    hessian_free(hessian);
+    gsl_vector_free(dx);
+    return v;
+}
+
 int main() {
     int n = 3;
-    ranker ranker;
-    ranker.n = n;
-    ranker.μ = gsl_vector_calloc(n);
-    ranker.ln_σ = gsl_vector_calloc(n);
-    ranker.ln_α = log(0.5);
-    ranker.ln_β = log(1.0);
+    ranker * ranker = ranker_alloc(n);
 
     // initialize ranker.μ->data to {0.1, -0.2, 0.3}
-    ranker.μ->data[0] = 0.1;
-    ranker.μ->data[1] = -0.2;
-    ranker.μ->data[2] = 0.3;
+    // μ = ranker->params[0:n], create a view, ditto for σ
+    gsl_vector_view μ = gsl_vector_subvector(ranker->params, 0, n);
+    gsl_vector_view ln_σ = gsl_vector_subvector(ranker->params, n, n);
+
+    // set the first element of μ to 0.1 using the data pointer  and the view μ
+    μ.vector.data[0] = 0.1;
+    μ.vector.data[1] = -0.2;
+    μ.vector.data[2] = 0.3;
+
     // initialize ranker.ln_σ->data to log({1.1, 2.2, 3.3})
-    ranker.ln_σ->data[0] = log(1.1);
-    ranker.ln_σ->data[1] = log(2.2);
-    ranker.ln_σ->data[2] = log(3.3);
+    ln_σ.vector.data[0] = log(1.1);
+    ln_σ.vector.data[1] = log(2.2);
+    ln_σ.vector.data[2] = log(3.3);
+
     // initialize ranker.ln_α to log(1.5) and ranker.ln_β to log(3.0)
-    ranker.ln_α = log(1.5);
-    ranker.ln_β = log(3.0);
+    gsl_vector_set(ranker->params, 2 * n, log(1.5));
+    gsl_vector_set(ranker->params, 2 * n + 1, log(3.0));
 
     observations obs;
     obs.X = gsl_spmatrix_alloc(1, 1);
@@ -433,7 +548,7 @@ int main() {
     gsl_vector * g = gsl_vector_calloc(2 * n + 2);
     hessian * h = hessian_alloc(n);
 
-    double v = evaluate(ranker, obs, g, h, NULL);
+    double v = evaluate(*ranker, obs, g, h, NULL);
     printf("%lf\n", v);
     for(int i = 0; i < 2 * n + 2; ++i) {
         printf("g: %lf\n", g->data[i]);
@@ -457,8 +572,7 @@ int main() {
 
     // cg with Hessian and gradient
     gsl_vector * dx = gsl_vector_calloc(2 * n + 2);
-    cg(h, g, dx, 1e-3, 1000);
-
+    cg(h, g, dx, 1e-10, 1e-3, 1000);
 
     // h dot dx
     gsl_vector * hdx = gsl_vector_calloc(2 * n + 2);
@@ -472,6 +586,25 @@ int main() {
         printf("dx: %lf\n", dx->data[i]);
     }
 
+    fit(*ranker, obs, 1e-8, 1000000);
+
+    // print ranker
+    for(int i = 0; i < n; ++i) {
+        printf("μ: %lf\n", ranker->params->data[i]);
+    }
+    for(int i = 0; i < n; ++i) {
+        printf("σ: %lf\n", exp(ranker->params->data[n+i]));
+    }
+    printf("α: %lf\n", exp(ranker->params->data[2*n]));
+    printf("β: %lf\n", exp(ranker->params->data[2*n+1]));
+
+
+    gsl_vector_free(hdx);
+    gsl_vector_free(dx);
+    gsl_spmatrix_free(obs.X);
+    gsl_vector_free(g);
+    hessian_free(h);
+    ranker_free(ranker);
 
 
 
