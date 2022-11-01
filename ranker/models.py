@@ -560,6 +560,11 @@ class VBayes():
                     factor = exp(-diff[self.n:])
                     self.params[self.n:] *= factor
 
+                    print(f"k={_}, v_new={self.eval(obs).val:e}, v={gh.val:e}, λ={λ:e}")
+                    print(f"μ={self.params[:self.n]}, σ={self.params[self.n:2*self.n]}, α={self.params[2*self.n]}, β={self.params[2*self.n+1]}")
+                    print(gh.g)
+                    print("\n")
+
                     if self.eval(obs).val < gh.val: # if it's better stop
                         if verbose and λ > λ0:
                             print(f"λ = {λ}")

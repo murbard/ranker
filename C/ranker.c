@@ -473,10 +473,22 @@ double fit(ranker ranker, const observations obs, const double tol, const int ma
             gsl_vector_sub(ranker.params, dx);
             double v_new = evaluate(ranker, obs, NULL, NULL, NULL);
 
+            printf("k = %d, v_new = %e < v = %e, λ = %e\n", k, v_new, v, λ);
+            // print params
+            for (int i = 0; i < ranker.n; i++) {
+                printf("μ%d = %e, σ%d = %e, ", i, ranker.params->data[i], i, exp(ranker.params->data[ranker.n + i]));
+            }
+            printf("α = %e, β = %e\n", exp(ranker.params->data[2 * ranker.n]), exp(ranker.params->data[2 * ranker.n + 1]));
+            // print what the gradient was
+            for (int i = 0; i < ranker.n; i++) {
+                printf("gμ%d = %e, gσ%d = %e, ", i, gradient->data[i], i, gradient->data[ranker.n + i]);
+            }
+            printf("gα = %e, gβ = %e\n\n", gradient->data[2 * ranker.n], gradient->data[2 * ranker.n + 1]);
             if (v_new < v) {
-                printf("v_new = %e < v = %e, λ = %e\n", v_new, v, λ);
+
                 break;
             } else {
+
                 gsl_vector_memcpy(ranker.params, save_params);
                 λ *= 10;
                 if (λ > 1e300) {
@@ -492,11 +504,9 @@ double fit(ranker ranker, const observations obs, const double tol, const int ma
 
                     exit(-1);
                 }
-
-                // print λ, the double, in scientific notation
-                printf("λ = %e, v_new = %e, v = %e\n", λ, v_new, v);
             }
         }
+        k += 1;
 
 
 
