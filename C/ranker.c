@@ -149,7 +149,7 @@ void hessian_to_dense(const hessian* const h, const gsl_matrix* dense) {
 
 void print_hessian(const hessian* const h) {
     int n = (h->diag->size - 2)/2;
-    gsl_matrix *dense = gsl_matrix_alloc(2 * n + 2, 2 * n + 2);
+    gsl_matrix *dense = gsl_matrix_calloc(2 * n + 2, 2 * n + 2);
     hessian_to_dense(h, dense);
     //gsl_matrix_fprintf(stdout, dense, "%g");
     // print in the Mathematica format on one line, i.e. {{...}, {...}, ...}

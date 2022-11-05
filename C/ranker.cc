@@ -4,6 +4,9 @@
 #include <boost/numeric/ublas/matrix_proxy.hpp>
 #include <boost/numeric/ublas/vector_proxy.hpp>
 #include <boost/numeric/ublas/matrix_sparse.hpp>
+#include <boost/numeric/ublas/assignment.hpp>
+#include <boost/assign/std/vector.hpp>
+
 
 // boost special functions erf, erfc, polygamma, digamma, lngamma
 #include <boost/math/special_functions/erf.hpp>
@@ -48,7 +51,7 @@ class Observations {
         // mapped matrix X
         mapped_matrix<int> X;
 
-        Observations(int n, int m) : X(n, m) {}
+        Observations(int n) : X(n, n) {}
         ~Observations() {}
         Observations(const Observations& other) : X(other.X) {}
         Observations(Observations&& other) : X(std::move(other.X)) {}
@@ -64,12 +67,12 @@ class Observations {
 
 class Hessian {
     public:
-        coordinate_matrix<int> obs;
+        coordinate_matrix<double> obs;
         vector<double> diag;
         double αβ;
         vector<double> μσαβ;
 
-        Hessian(int n) : obs(n, 2 * n + 2), diag(n), αβ(0), μσαβ(2 * n + 2) {}
+        Hessian(int n) : obs(2 * n, 2 * n), diag(2 * n + 2), αβ(0), μσαβ(2 * n + 2) {}
         ~Hessian() {}
         Hessian(const Hessian& other) : obs(other.obs), diag(other.diag), αβ(other.αβ), μσαβ(other.μσαβ) {}
         Hessian(Hessian&& other) : obs(std::move(other.obs)), diag(std::move(other.diag)), αβ(std::move(other.αβ)), μσαβ(std::move(other.μσαβ)) {}
@@ -86,6 +89,37 @@ class Hessian {
             αβ = std::move(other.αβ);
             μσαβ = std::move(other.μσαβ);
             return *this;
+        }
+
+        matrix<double> toDense() {
+            const int n = (diag.size() - 2) / 2;
+            matrix<double> dense(2 * n + 2, 2 * n + 2, 0.0);
+
+            // fill the diagonal
+            for (int i = 0; i < 2 * n + 2; i++) {
+                dense(i, i) = diag(i);
+            }
+            // fill the off-diagonal
+            for (int i = 0; i < 2 * n ; i++) {
+                for (int j = i + 1; j < 2 * n ; j++) {
+                    dense(i, j) += obs(i, j);
+                    dense(j, i) += obs(i, j);
+                }
+            }
+            // fill in the αβ and βα terms
+            dense(2 * n, 2 * n + 1) += αβ;
+            dense(2 * n + 1, 2 * n) += αβ;
+
+
+            // fill in the μσαβ and αβμσ terms
+            for (int i = 0; i < 2 * n; i++) {
+                dense(i, 2 * n ) += μσαβ(i);
+                dense(i, 2 * n + 1) += μσαβ(i);
+                dense(2 * n, i) += μσαβ(i);
+                dense(2 * n + 1 , i) += μσαβ(i);
+            }
+
+            return dense;
         }
 };
 
@@ -114,16 +148,52 @@ class Ranker {
             gradient = std::move(other.gradient);
             return *this;
         }
+        std::string print_gradient() {
+            std::stringstream ss;
+            if (!gradient)
+                ss << "none";
+            else {
+                ss << "{";
+                for (int i = 0; i < gradient->size(); i++) {
+                    ss << (*gradient)[i];
+                    if (i < gradient->size() - 1)
+                        ss << ", ";
+                }
+            }
+            ss << "}";
+            return ss.str();
+        }
+        std::string print_hessian() {
+            std::stringstream ss;
+            if (!hessian)
+                ss << "none";
+            else {
+                auto dense = hessian->toDense();
+                ss << "{";
+                for (int i = 0; i < dense.size1(); i++) {
+                    ss << "{";
+                    for (int j = 0; j < dense.size2(); j++) {
+                        ss << dense(i, j) ;
+                        if (j != dense.size2() - 1)
+                            ss << ", ";
+                    }
+                    ss << "}";
+                    if (i != dense.size1() - 1)
+                        ss << ", ";
+                }
+                ss << "}";
+            }
+            return ss.str();
+        }
 
-    private:
+    public:
         optional<double> val;
         optional<vector<double>> gradient;
         optional<Hessian> hessian;
 
-        void evaluate(const Observations& obs, const bool compute_gradient, const bool compute_hessian) {
-            const int n = this->n;
-            const double ln_α = this->params(2 * n);
-            const double ln_β = this->params(2 * n + 1);
+        void evaluate(const Observations& obs, const bool compute_gradient = false, const bool compute_hessian = false) {
+            const double ln_α = params(2 * n);
+            const double ln_β = params(2 * n + 1);
             const double α = exp(ln_α);
             const double β = exp(ln_β);
             const double αβ = α * β;
@@ -132,25 +202,25 @@ class Ranker {
             const double psi2_α = polygamma(2, α);
             // μ is a vector slice of the virst n elements of params. It's just a view on the object and provides
             // a lightweight proxy, no copy happens. This uses thje boost function "project"
-            vector_range<vector<double>> μ = project(this->params, ublas::range(0, n));
-            vector_range<vector<double>> ln_σ = project(this->params, ublas::range(n, 2 * n));
+            vector_range<vector<double>> μ = project(params, ublas::range(0, n));
+            vector_range<vector<double>> ln_σ = project(params, ublas::range(n, 2 * n));
             vector<double> σ2(n);
-            vector_range<vector<double>> g_μ = project(*(this->gradient), ublas::range(0, n));
-            vector_range<vector<double>> g_σ = project(*(this->gradient), ublas::range(n, 2 * n));
+            vector_range<vector<double>> g_μ = project(*(gradient), ublas::range(0, n));
+            vector_range<vector<double>> g_σ = project(*(gradient), ublas::range(n, 2 * n));
 
             if (compute_gradient) {
                 // if gradient is null initialize it
-                if (!this->gradient) {
-                    this->gradient = vector<double>(2 * n + 2);
+                if (!gradient) {
+                    gradient = vector<double>(2 * n + 2);
                 }
             }
             if (compute_hessian) {
                 // if hessian is null initialize it
-                if (!this->hessian) {
-                    this->hessian = Hessian(n);
+                if (!hessian) {
+                    hessian = Hessian(n);
                 }
                 // it it's not null, erase the obs part, the rest is just overwritten
-                this->hessian->obs.clear();
+                hessian->obs.clear();
             }
 
             // Compute sum of μi² + σi², and sum of ln(σi)
@@ -174,9 +244,9 @@ class Ranker {
 
                 // Compute gradient
                 // dv/dα
-                (*(this->gradient))(2 * n) = 0.5 * α *( -2 + 2 * β / Mβ - (2 * Mα + n - 2 * α) * psi1_α + β * Σ_μ2_σ2);
+                (*gradient)(2 * n) = 0.5 * α *( -2 + 2 * β / Mβ - (2 * Mα + n - 2 * α) * psi1_α + β * Σ_μ2_σ2);
                 // dv/dβ
-                (*(this->gradient))(2 * n + 1) = - Mα - 0.5 * n + αβ / Mβ + 0.5 * αβ * Σ_μ2_σ2;
+                (*gradient)(2 * n + 1) = - Mα - 0.5 * n + αβ / Mβ + 0.5 * αβ * Σ_μ2_σ2;
 
                 // dv/dμi and dv/dlnσi
                 // set the first n elements of gh.g to αβ * ranker.μ using daxpy
@@ -191,32 +261,33 @@ class Ranker {
                 // Compute Hessian
                 // d²v/dμi² and d²v/dlnσi²
                 // set the first n elements of gh.h.diag to 1 and the next n elements to 2 * σ2
-                vector_range<vector<double>> diag_μ = project(this->hessian->diag, ublas::range(0, n));
+                vector_range<vector<double>> diag_μ = project(hessian->diag, ublas::range(0, n));
                 diag_μ = vector<double>(n, 1.0);
-                vector_range<vector<double>> diag_σ = project(this->hessian->diag, ublas::range(n, 2 * n));
+                vector_range<vector<double>> diag_σ = project(hessian->diag, ublas::range(n, 2 * n));
                 diag_σ = 2.0 * σ2;
+
                 // scale the whole thing by αβ
-                this->hessian->diag *= αβ;
+                hessian->diag *= αβ;
 
                 // d²v/dα²
-                this->hessian->diag(2 * n) =
+                hessian->diag(2 * n) =
                     0.5 * α *(-2 + 2 * β / Mβ - (2 * Mα + n - 4 * α) * psi1_α + β * Σ_μ2_σ2 - (2 * Mα + n - 2 * α) * α * psi2_α);
 
                 // d²v/dαdβ
-                this->hessian->αβ = 0.5 * αβ * (2 / Mβ + Σ_μ2_σ2);
+                hessian->αβ = 0.5 * αβ * (2 / Mβ + Σ_μ2_σ2);
 
                 // d²v/dβ²
-                this->hessian->diag(2 * n + 1) = this->hessian->αβ; // same value as the cross term
+                hessian->diag(2 * n + 1) = hessian->αβ; // same value as the cross term
 
                 // d²v/d{μ|σ}id{α|β}
                 // place vector ranker.μ as the first half of the gh.h.μσαβ vector
-                vector_range<vector<double>> αβ_μ = project(this->hessian->μσαβ, ublas::range(0, n));
+                vector_range<vector<double>> αβ_μ = project(hessian->μσαβ, ublas::range(0, n));
                 αβ_μ = μ;
                 // place vector σ2 as the second half of the gh.h.μσαβ vector
-                vector_range<vector<double>> αβ_σ = project(this->hessian->μσαβ, ublas::range(n, 2 * n));
+                vector_range<vector<double>> αβ_σ = project(hessian->μσαβ, ublas::range(n, 2 * n));
                 αβ_σ = σ2;
                 // scale gh.h.μσαβ by αβ
-                this->hessian->μσαβ *= αβ;
+                hessian->μσαβ *= αβ;
             }
 
             // Now we add observations
@@ -265,29 +336,54 @@ class Ranker {
                         const double hσσδ = - exp_minus_μδ_over_h_square * (256 + 4 * M_PI * σδ * σδ * (8 + μδ * μδ)) / sqrt_π_h5;
 
                         // diagonal hessian terms
-                        this->hessian->diag(i) -= count * hμμδ;
-                        this->hessian->diag(j) -= count * hμμδ;
-                        this->hessian->diag(n+i) -= count * σ2(i) / σδ * (gσδ * σ2(j) / (σδ * σδ) + hσσδ * σ2(i) / σδ + gσδ);
-                        this->hessian->diag(n+j) -= count * σ2(j) / σδ * (gσδ * σ2(i) / (σδ * σδ) + hσσδ * σ2(j) / σδ + gσδ);
+                        hessian->diag(i) -= count * hμμδ;
+                        hessian->diag(j) -= count * hμμδ;
+                        hessian->diag(n+i) -= count * σ2(i) / σδ * (gσδ * σ2(j) / (σδ * σδ) + hσσδ * σ2(i) / σδ + gσδ);
+                        hessian->diag(n+j) -= count * σ2(j) / σδ * (gσδ * σ2(i) / (σδ * σδ) + hσσδ * σ2(j) / σδ + gσδ);
 
                         int row = std::min(i, j);
                         int col = std::max(i, j);
 
                         // hμiμj, hσiσj
-                        this->hessian->obs(row, col) += count * hμμδ;
-                        this->hessian->obs(n + row, n + col) -= count * (σ2(i) * σ2(j) / (σδ * σδ) * (hσσδ - gσδ / σδ));
+                        hessian->obs(row, col) += count * hμμδ;
+                        std::cout << "hessian->obs(" << row << ", " << col << " == " << hessian->obs(row, col) << std::endl;
+                        hessian->obs(n + row, n + col) -= count * (σ2(i) * σ2(j) / (σδ * σδ) * (hσσδ - gσδ / σδ));
 
                         // hμiσi, hμjσi
                         double chσ = count * hμσδ * σ2(i) / σδ;
-                        this->hessian->obs(i, n + i) -= chσ;
-                        this->hessian->obs(j, n + i) += chσ;
+                        hessian->obs(i, n + i) -= chσ;
+                        hessian->obs(j, n + i) += chσ;
 
                         // hμiσj, hμjσj
                         chσ = count * hμσδ * σ2(j) / σδ;
-                        this->hessian->obs(i, n + j) -= chσ;
-                        this->hessian->obs(j, n + j) += chσ;
+                        hessian->obs(i, n + j) -= chσ;
+                        hessian->obs(j, n + j) += chσ;
                     }
                 }
             }
         }
 };
+
+int main(int argn, std::vector<std::string> argv) {
+
+    const int n = 3;
+
+    // initialize ublas vector to {0.1, -0.2, 0.3, log(1.1), log(2.2), log(3.3), log(1.5), log(3.0)}
+    ublas::vector<double> params(2 * n + 2);
+    params <<= 0.1, -0.2, 0.3, log(1.1), log(2.2), log(3.3), log(1.5), log(3.0);
+    Ranker ranker(n, params);
+    Observations obs(n);
+    obs.X(0, 2) = 2.0;
+    obs.X(1, 2) = 2.0;
+    obs.X(2, 0) = 3.0;
+    obs.X(1, 0) = 1.0;
+
+    ranker.evaluate(obs, true, true);
+
+    // print all parts of the gradient and hessian
+    std::cout << ranker.print_gradient() << std::endl;
+    std::cout << ranker.print_hessian() << std::endl;
+
+    return 0;
+
+}
