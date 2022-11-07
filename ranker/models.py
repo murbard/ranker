@@ -802,4 +802,6 @@ if __name__ == '__main__':
     obs[1,0] = 1
     obs = coo_matrix(obs)
     vbayes.fit(obs=obs)
-    print(gh.g)
+    gh = vbayes.eval(obs, compute_gradient=True, compute_hessian=True)
+    print(gh.val)
+    print(vbayes.params)

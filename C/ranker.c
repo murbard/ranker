@@ -243,11 +243,11 @@ void cg(const hessian * const hessian, const gsl_vector * const y, gsl_vector * 
         gsl_vector_div(z_[(k+1)&1], hessian->diag);
         gsl_vector_scale(z_[(k+1)&1], 1.0 / (1.0 + λ));
 
-        // βk = (r1 . r1) / (r0 . r0)
+        // βk = (r1 . z1) / (r0 . z0)
         double rk1Tzk1;
         gsl_blas_ddot(r_[(k+1)&1], z_[(k+1)&1], &rk1Tzk1);
         double βk = rk1Tzk1 / rkTzk;
-        // p1 = r1 + βk * p0
+        // p1 = z1 + β0 * p0
         gsl_vector_memcpy(p_[(k+1)&1], z_[(k+1)&1]);
         gsl_blas_daxpy(βk, p_[k&1], p_[(k+1)&1]);
         k = k + 1;

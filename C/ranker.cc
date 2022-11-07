@@ -7,7 +7,6 @@
 #include <boost/numeric/ublas/assignment.hpp>
 #include <boost/assign/std/vector.hpp>
 
-
 // boost special functions erf, erfc, polygamma, digamma, lngamma
 #include <boost/math/special_functions/erf.hpp>
 #include <boost/math/special_functions/polygamma.hpp>
@@ -72,7 +71,7 @@ class Hessian {
         double αβ;
         vector<double> μσαβ;
 
-        Hessian(int n) : obs(2 * n, 2 * n), diag(2 * n + 2), αβ(0), μσαβ(2 * n + 2) {}
+        Hessian(int n) : obs(2 * n, 2 * n), diag(2 * n + 2), αβ(0), μσαβ(2 * n) {}
         ~Hessian() {}
         Hessian(const Hessian& other) : obs(other.obs), diag(other.diag), αβ(other.αβ), μσαβ(other.μσαβ) {}
         Hessian(Hessian&& other) : obs(std::move(other.obs)), diag(std::move(other.diag)), αβ(std::move(other.αβ)), μσαβ(std::move(other.μσαβ)) {}
@@ -89,6 +88,36 @@ class Hessian {
             αβ = std::move(other.αβ);
             μσαβ = std::move(other.μσαβ);
             return *this;
+        }
+
+        vector<double> dot(const vector<double>& x) {
+            vector<double> y(x.size());
+            int n = (x.size() - 2)/2;
+            // the dimensions are 2 * n + 2
+
+            // view of diag, x, and out, excluding last two elements, called diag_μσ, x_μσ, and out_μσ
+            // uses project
+
+            auto diag_μσ = project(diag, ublas::range(0, 2 * n));
+            auto x_μσ = project(x, ublas::range(0, 2 * n));
+            auto y_μσ = project(y, ublas::range(0, 2 * n));
+
+            // y_μσ = diag_μσ * x_μσ + μσαβ * (x[2 * n] + x[2 * n + 1])
+            y_μσ = element_prod(diag_μσ, x_μσ) + μσαβ * (x[2 * n] + x[2 * n + 1]);
+
+            // y[2 * n] = μσαβ . x_μσ + diag[2 * n] * x[2 * n] + αβ * x[2 * n + 1]
+            // y[2 * n + 1] = μσαβ . x_μσ + diag[2 * n + 1] * x[2 * n + 1] + αβ * x[2 * n]
+            double μσαβx = inner_prod(μσαβ, x_μσ);
+            y[2 * n] = μσαβx + diag[2 * n] * x[2 * n] + αβ * x[2 * n + 1];
+            y[2 * n + 1] = μσαβx + αβ * x[2 * n] + diag[2 * n + 1] * x[2 * n + 1];
+
+            // y[:-2] += h.obs @ x[:-2] + h.obs.T @ x[:-2]
+            // remember that out is a sparse upper triangular matrix representing a symmetric matrix
+
+            y_μσ += prod(obs, x_μσ);
+            // now with the transpose
+            y_μσ += prod(trans(obs), x_μσ);
+            return y;
         }
 
         matrix<double> toDense() {
@@ -120,6 +149,34 @@ class Hessian {
             }
 
             return dense;
+        }
+        vector<double> cg(const vector<double>& b, const double λ, const double tol, const int max_iter) {
+            const int size = b.size();
+            vector<double> x(size, 0.0);
+            vector<double> Hp(size);
+            vector<double> r(b);
+            vector<double> z(b);
+            z = element_div(z, diag);
+            z *= 1.0/(1.0 + λ);
+            vector<double> p = vector<double>(z);
+
+            int k = 0;
+            while(k < max_iter) {
+                Hp = dot(p) + λ * element_prod(diag, p);
+                double pkTHpk = inner_prod(p, Hp);
+                double αk = inner_prod(r, z) / pkTHpk;
+                double rkTzk = inner_prod(r, z);
+                x += αk * p;
+                r -=  αk * Hp;
+                if (norm_2(r) < tol)
+                    break;
+                z = element_div(r, diag);
+                z *= 1.0 / (1.0 + λ);
+                double βk = inner_prod(r, z) / rkTzk;
+                p = z + βk * p;
+                k++;
+            }
+            return x;
         }
 };
 
@@ -346,7 +403,6 @@ class Ranker {
 
                         // hμiμj, hσiσj
                         hessian->obs(row, col) += count * hμμδ;
-                        std::cout << "hessian->obs(" << row << ", " << col << " == " << hessian->obs(row, col) << std::endl;
                         hessian->obs(n + row, n + col) -= count * (σ2(i) * σ2(j) / (σδ * σδ) * (hσσδ - gσδ / σδ));
 
                         // hμiσi, hμjσi
@@ -361,10 +417,58 @@ class Ranker {
                     }
                 }
             }
+            if (!val)
+                val = optional<double>(v);
+            else
+                *val = v;
+        }
+
+        void fit(const Observations& obs, const double tol = 1e-8, const int max_iter = 1e6) {
+            int k = 0;
+            while (k < max_iter) {
+                evaluate(obs, true, true);
+                bool positive = true;
+                for (int i = 0; i < 2 * n + 2; i++) {
+                    if (hessian->diag(i) <= 0) {
+                        positive = false;
+                        break;
+                    }
+                }
+                if (!positive) {
+                    // throw "ruhroh" exception
+                    throw std::runtime_error("non positive diagonal");
+                }
+                double λ = 1e-10;
+                Ranker other(n);
+                do {
+                    // cg (hessian, gradient, dx,  1e-10, tol, 1000 * n );
+                    // use the ublas cg solver with diagonal preconditioner
+                    vector<double> save_params(2 * n + 2);
+                    auto dx = std::move(hessian->cg(*gradient, λ, tol, 1000 * n));
+                    other = std::move(Ranker(n, params - dx));
+                    other.evaluate(obs);
+                    if (*other.val < *val) {
+                        break;
+                    } else {
+                        λ *= 10;
+                        if (λ > 1e10)
+                            throw std::runtime_error("giving up");
+                    }
+                } while (true);
+                *this = std::move(other);
+                // if the gradient is small, we're done
+                if (norm_2(*gradient) < tol) {
+                    break;
+                }
+            }
         }
 };
 
-int main(int argn, std::vector<std::string> argv) {
+/// @brief
+/// @param argc
+/// @param argv
+/// @return
+int main(int argc, char ** argv) {
 
     const int n = 3;
 
@@ -383,6 +487,15 @@ int main(int argn, std::vector<std::string> argv) {
     // print all parts of the gradient and hessian
     std::cout << ranker.print_gradient() << std::endl;
     std::cout << ranker.print_hessian() << std::endl;
+
+    // fit
+    ranker.fit(obs);
+
+
+    ranker.evaluate(obs, true, true);
+    std::cout << ranker.print_gradient() << std::endl;
+    std::cout << ranker.print_hessian() << std::endl;
+    std::cout << *ranker.val << std::endl;
 
     return 0;
 
