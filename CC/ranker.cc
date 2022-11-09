@@ -13,6 +13,16 @@
 #include <boost/math/special_functions/digamma.hpp>
 #include <boost/math/special_functions/gamma.hpp>
 
+
+// boost random
+#include <boost/random.hpp>
+#include <boost/random/normal_distribution.hpp>
+#include <boost/random/variate_generator.hpp>
+#include <boost/random/gamma_distribution.hpp>
+
+
+#include <cstdlib>
+
 // boost optional
 #include <boost/optional.hpp>
 
@@ -23,6 +33,18 @@ using namespace boost::math;
 
 const double Mα = 1.2;
 const double Mβ = 2.0;
+
+// boost variate generator
+typedef boost::mt19937 RNGType;
+typedef boost::random::normal_distribution<> Normal;
+typedef boost::random::variate_generator<RNGType&, Normal> NormalGen;
+
+typedef boost::random::gamma_distribution<> Gamma;
+typedef boost::random::variate_generator<RNGType&, Gamma> GammaGen;
+RNGType rng;
+
+GammaGen gammagen(rng, Gamma(Mα, 1.0/  Mβ));
+NormalGen normalgen(rng, Normal(0, 1));
 
 class Instance {
     public:
@@ -43,6 +65,18 @@ class Instance {
             v = std::move(other.v);
             return *this;
         }
+        // static method that generates a random instnace
+        static Instance random(int n) {
+            Instance inst(n);
+            // draw a random value for v from an inverse gamma
+            // distribution with parameters Mα and scale=1/Mβ
+            inst.v = 1.0 / gammagen();
+            // draw a random vector z from a normal distribution with mean 0 and variance v
+            for (int i = 0; i < n; i++) {
+                inst.z(i) = normalgen() * sqrt(inst.v);
+            }
+            return inst;
+        }
 };
 
 class Observations {
@@ -51,6 +85,24 @@ class Observations {
         mapped_matrix<int> X;
 
         Observations(int n) : X(n, n) {}
+        Observations(int n, const Instance& instance, int count) : X(n,n) {
+            X.reserve(count);
+            // draw from the binomial distribution with count = count and
+            // n(n-1)/2 buckets
+            const int m = n*(n-1)/2;
+            for(int c = 0 ; c < count ; c++) {
+                int i = rand() % n;
+                int j = rand() % n;
+                while (i == j) {
+                    j = rand() % n;
+                }
+                double p = 1.0 / (1.0 + exp(-instance.z(i)+instance.z(j)));
+                double r = (double)rand() / (double)RAND_MAX;
+                if (r < p) {
+                    X(i,j) += 1;
+                }
+            }
+        }
         ~Observations() {}
         Observations(const Observations& other) : X(other.X) {}
         Observations(Observations&& other) : X(std::move(other.X)) {}
@@ -63,6 +115,8 @@ class Observations {
             return *this;
         }
 };
+
+
 
 class Hessian {
     public:
@@ -186,7 +240,7 @@ class Ranker {
         vector<double> params;
 
         Ranker(int n) : n(n), params(2 * n + 2), hessian(), gradient(), val() {}
-        Ranker(int n, vector<double> params) : n(n), params(params), hessian(n), gradient(2 * n + 2) {}
+        Ranker(int n, const vector<double> &params) : n(n), params(params), hessian(), gradient(), val() {}
 
         ~Ranker() {}
         Ranker(const Ranker& other) : n(other.n), params(other.params), hessian(other.hessian), gradient(other.gradient) {}
@@ -262,14 +316,17 @@ class Ranker {
             vector_range<vector<double>> μ = project(params, ublas::range(0, n));
             vector_range<vector<double>> ln_σ = project(params, ublas::range(n, 2 * n));
             vector<double> σ2(n);
-            vector_range<vector<double>> g_μ = project(*(gradient), ublas::range(0, n));
-            vector_range<vector<double>> g_σ = project(*(gradient), ublas::range(n, 2 * n));
+            optional<vector_range<vector<double>>> g_μ;
+            optional<vector_range<vector<double>>> g_σ;
+
 
             if (compute_gradient) {
                 // if gradient is null initialize it
                 if (!gradient) {
                     gradient = vector<double>(2 * n + 2);
                 }
+                g_μ = project(*(gradient), ublas::range(0, n));
+                g_σ = project(*(gradient), ublas::range(n, 2 * n));
             }
             if (compute_hessian) {
                 // if hessian is null initialize it
@@ -307,10 +364,10 @@ class Ranker {
 
                 // dv/dμi and dv/dlnσi
                 // set the first n elements of gh.g to αβ * ranker.μ using daxpy
-                g_μ = αβ * μ;
+                *g_μ = αβ * μ;
                 // set the elements n to 2n of gh.g to -1 + αβ * σ2
-                g_σ = αβ * σ2;
-                for (auto& el : g_σ) { el -= 1.0; }
+                *g_σ = αβ * σ2;
+                for (auto& el : *g_σ) { el -= 1.0; }
              }
 
              if (compute_hessian) {
@@ -373,12 +430,12 @@ class Ranker {
                     if (compute_gradient) {
                         // Compute gradient
                         // dv/dμi, dv/dμj
-                        g_μ(i) += count * gμδ;
-                        g_μ(j) -= count * gμδ;
+                        (*g_μ)(i) += count * gμδ;
+                        (*g_μ)(j) -= count * gμδ;
 
                         // dv/dlnσi, dv/dlnσj
-                        g_σ(i) -= count * (gσδ * σ2(i) / σδ);
-                        g_σ(j) -= count * (gσδ * σ2(j) / σδ);
+                        (*g_σ)(i) -= count * (gσδ * σ2(i) / σδ);
+                        (*g_σ)(j) -= count * (gσδ * σ2(j) / σδ);
                     }
 
                     if (compute_hessian) {
@@ -427,6 +484,10 @@ class Ranker {
             int k = 0;
             while (k < max_iter) {
                 evaluate(obs, true, true);
+                // if the gradient is small, we're done
+                if (norm_2(*gradient) < tol) {
+                    break;
+                }
                 bool positive = true;
                 for (int i = 0; i < 2 * n + 2; i++) {
                     if (hessian->diag(i) <= 0) {
@@ -447,7 +508,7 @@ class Ranker {
                     auto dx = std::move(hessian->cg(*gradient, λ, tol, 1000 * n));
                     other = std::move(Ranker(n, params - dx));
                     other.evaluate(obs);
-                    if (*other.val < *val) {
+                    if ((*other.val) < (*val)) {
                         break;
                     } else {
                         λ *= 10;
@@ -456,10 +517,7 @@ class Ranker {
                     }
                 } while (true);
                 *this = std::move(other);
-                // if the gradient is small, we're done
-                if (norm_2(*gradient) < tol) {
-                    break;
-                }
+                k++;
             }
         }
 };
@@ -492,10 +550,16 @@ int main(int argc, char ** argv) {
     ranker.fit(obs);
 
 
+
+
     ranker.evaluate(obs, true, true);
     std::cout << ranker.print_gradient() << std::endl;
     std::cout << ranker.print_hessian() << std::endl;
     std::cout << *ranker.val << std::endl;
+
+    Instance inst = Instance::random(100);
+    obs = Observations(100, inst, 10000);
+    ranker.fit(obs);
 
     return 0;
 
