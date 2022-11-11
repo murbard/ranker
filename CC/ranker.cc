@@ -1,3 +1,5 @@
+//todo, do as much as possible directly in compressed format
+
 // include boost ublas for matrices and vectors
 #include <boost/numeric/ublas/matrix.hpp>
 #include <boost/numeric/ublas/vector.hpp>
@@ -83,6 +85,8 @@ class Observations {
     public:
         // mapped matrix X
         mapped_matrix<int> X;
+        // optional coordinate matrix that matches X
+        optional<coordinate_matrix<int> > Xcoord;
 
         Observations(int n) : X(n, n) {}
         Observations(int n, const Instance& instance, int count) : X(n,n) {
@@ -114,13 +118,17 @@ class Observations {
             X = std::move(other.X);
             return *this;
         }
+
+        void computeCoordinateMatrix() {
+            Xcoord = optional<coordinate_matrix<int>>(X);
+        }
 };
 
 
 
 class Hessian {
     public:
-        coordinate_matrix<double> obs;
+        compressed_matrix<double> obs;
         vector<double> diag;
         double αβ;
         vector<double> μσαβ;
@@ -303,6 +311,7 @@ class Ranker {
         optional<Hessian> hessian;
 
         void evaluate(const Observations& obs, const bool compute_gradient = false, const bool compute_hessian = false) {
+
             const double ln_α = params(2 * n);
             const double ln_β = params(2 * n + 1);
             const double α = exp(ln_α);
@@ -407,6 +416,8 @@ class Ranker {
             // Now we add observations
             // We loop over all non zero elements of the sparse observation matrix, obs.X
 
+            mapped_matrix<double> hobs(2 * n, 2 * n);
+
             for(auto it = obs.X.begin1() ; it != obs.X.end1(); ++it) {
                 for(auto el = it.begin(); el != it.end(); ++el) {
                     const int i = el.index1();
@@ -459,20 +470,23 @@ class Ranker {
                         int col = std::max(i, j);
 
                         // hμiμj, hσiσj
-                        hessian->obs(row, col) += count * hμμδ;
-                        hessian->obs(n + row, n + col) -= count * (σ2(i) * σ2(j) / (σδ * σδ) * (hσσδ - gσδ / σδ));
+                        hobs(row, col) += count * hμμδ;
+                        hobs(n + row, n + col) -= count * (σ2(i) * σ2(j) / (σδ * σδ) * (hσσδ - gσδ / σδ));
 
                         // hμiσi, hμjσi
                         double chσ = count * hμσδ * σ2(i) / σδ;
-                        hessian->obs(i, n + i) -= chσ;
-                        hessian->obs(j, n + i) += chσ;
+                        hobs(i, n + i) -= chσ;
+                        hobs(j, n + i) += chσ;
 
                         // hμiσj, hμjσj
                         chσ = count * hμσδ * σ2(j) / σδ;
-                        hessian->obs(i, n + j) -= chσ;
-                        hessian->obs(j, n + j) += chσ;
+                        hobs(i, n + j) -= chσ;
+                        hobs(j, n + j) += chσ;
                     }
                 }
+                if (compute_hessian)
+                    hessian->obs = hobs;
+
             }
             if (!val)
                 val = optional<double>(v);
@@ -517,6 +531,7 @@ class Ranker {
                     }
                 } while (true);
                 *this = std::move(other);
+                std::cout << "iter: " << k << ", val:" << *val << ", λ: " << λ << std::endl;
                 k++;
             }
         }
@@ -557,8 +572,10 @@ int main(int argc, char ** argv) {
     std::cout << ranker.print_hessian() << std::endl;
     std::cout << *ranker.val << std::endl;
 
-    Instance inst = Instance::random(100);
-    obs = Observations(100, inst, 10000);
+
+    Instance inst = Instance::random(200);
+    obs = Observations(200, inst, 200 * 200 * 10);
+    ranker = Ranker(200);
     ranker.fit(obs);
 
     return 0;
