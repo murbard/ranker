@@ -132,16 +132,18 @@ class Hessian {
         vector<double> diag;
         double αβ;
         vector<double> μσαβ;
+        vector<double> obsμσ;
 
-        Hessian(int n) : obs(2 * n, 2 * n), diag(2 * n + 2), αβ(0), μσαβ(2 * n) {}
+        Hessian(int n) : obs(2 * n, 2 * n), diag(2 * n + 2), αβ(0), μσαβ(2 * n), obsμσ(n) {}
         ~Hessian() {}
-        Hessian(const Hessian& other) : obs(other.obs), diag(other.diag), αβ(other.αβ), μσαβ(other.μσαβ) {}
-        Hessian(Hessian&& other) : obs(std::move(other.obs)), diag(std::move(other.diag)), αβ(std::move(other.αβ)), μσαβ(std::move(other.μσαβ)) {}
+        Hessian(const Hessian& other) : obs(other.obs), diag(other.diag), αβ(other.αβ), μσαβ(other.μσαβ), obsμσ(other.obsμσ) {}
+        Hessian(Hessian&& other) : obs(std::move(other.obs)), diag(std::move(other.diag)), αβ(std::move(other.αβ)), μσαβ(std::move(other.μσαβ)), obsμσ(std::move(other.obsμσ)) {}
         Hessian& operator=(const Hessian& other) {
             obs = other.obs;
             diag = other.diag;
             αβ = other.αβ;
             μσαβ = other.μσαβ;
+            obsμσ = other.obsμσ;
             return *this;
         }
         Hessian& operator=(Hessian&& other) {
@@ -149,6 +151,7 @@ class Hessian {
             diag = std::move(other.diag);
             αβ = std::move(other.αβ);
             μσαβ = std::move(other.μσαβ);
+            obsμσ = std::move(other.obsμσ);
             return *this;
         }
 
@@ -179,6 +182,16 @@ class Hessian {
             y_μσ += prod(obs, x_μσ);
             // now with the transpose
             y_μσ += prod(trans(obs), x_μσ);
+
+            // obsμσ is multiplied element wise with the x_σ and added to y_μ
+            auto x_σ = project(x, ublas::range(n, 2 * n));
+            auto y_μ = project(y, ublas::range(0, n));
+            y_μ += element_prod(obsμσ, x_σ);
+
+            auto x_μ = project(x, ublas::range(0, n));
+            auto y_σ = project(y, ublas::range(n, 2 * n));
+            y_σ += element_prod(obsμσ, x_μ);
+
             return y;
         }
 
@@ -417,6 +430,10 @@ class Ranker {
             // We loop over all non zero elements of the sparse observation matrix, obs.X
 
             coordinate_matrix<double> hobs(2 * n, 2 * n, obs.X.nnz() * 6);
+            // idea, crystalize obs.X into a compressed matrix
+            // then create a compressed matrix with the right shape
+            // for hessian->obs, and we can naturally fill it
+            // with the right values
 
             for(auto it = obs.X.begin1() ; it != obs.X.end1(); ++it) {
                 for(auto el = it.begin(); el != it.end(); ++el) {
@@ -474,14 +491,16 @@ class Ranker {
                         hobs.append_element(n + row, n + col, - count * (σ2(i) * σ2(j) / (σδ * σδ) * (hσσδ - gσδ / σδ)));
 
                         // hμiσi, hμjσi
-                        double chσ = count * hμσδ * σ2(i) / σδ;
-                        hobs.append_element(i, n + i, - chσ);
-                        hobs.append_element(j, n + i, chσ);
+                        double chσi = count * hμσδ * σ2(i) / σδ;
+                        hessian->obsμσ(i) -= chσi;
+                        //hobs.append_element(i, n + i, - chσi);
+                        hobs.append_element(j, n + i, chσi);
 
                         // hμiσj, hμjσj
-                        chσ = count * hμσδ * σ2(j) / σδ;
-                        hobs.append_element(i, n + j, - chσ);
-                        hobs.append_element(j, n + j, chσ);
+                        double chσj = count * hμσδ * σ2(j) / σδ;
+                        hobs.append_element(i, n + j, - chσj);
+                        hessian->obsμσ(j) += chσj;
+                        // hobs.append_element(j, n + j, chσj);
                     }
                 }
                 if (compute_hessian)
@@ -574,7 +593,7 @@ int main(int argc, char ** argv) {
 
     int m = 200;
     Instance inst = Instance::random(m);
-    obs = Observations(m, inst, m * m* 10);
+    obs = Observations(m, inst, m * 10);
     ranker = Ranker(m);
     ranker.fit(obs);
 
