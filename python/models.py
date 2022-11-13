@@ -560,10 +560,6 @@ class VBayes():
                     factor = exp(-diff[self.n:])
                     self.params[self.n:] *= factor
 
-                    print(f"k={_}, v_new={self.eval(obs).val:e}, v={gh.val:e}, λ={λ:e}")
-                    print(f"μ={self.params[:self.n]}, σ={self.params[self.n:2*self.n]}, α={self.params[2*self.n]}, β={self.params[2*self.n+1]}")
-                    print(gh.g)
-                    print("\n")
 
                     if self.eval(obs).val < gh.val: # if it's better stop
                         if verbose and λ > λ0:
@@ -803,5 +799,8 @@ if __name__ == '__main__':
     obs = coo_matrix(obs)
     vbayes.fit(obs=obs)
     gh = vbayes.eval(obs, compute_gradient=True, compute_hessian=True)
-    print(gh.val)
-    print(vbayes.params)
+
+    vbayes = VBayes(Model(n=200))
+    instance = vbayes.model.rvs()
+    obs = instance.observe(200 * 200 * 10)
+    vbayes.fit(obs=obs, verbose=True)

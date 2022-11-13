@@ -128,7 +128,7 @@ class Observations {
 
 class Hessian {
     public:
-        compressed_matrix<double> obs;
+        coordinate_matrix<double> obs;
         vector<double> diag;
         double αβ;
         vector<double> μσαβ;
@@ -416,7 +416,7 @@ class Ranker {
             // Now we add observations
             // We loop over all non zero elements of the sparse observation matrix, obs.X
 
-            mapped_matrix<double> hobs(2 * n, 2 * n);
+            coordinate_matrix<double> hobs(2 * n, 2 * n, obs.X.nnz() * 6);
 
             for(auto it = obs.X.begin1() ; it != obs.X.end1(); ++it) {
                 for(auto el = it.begin(); el != it.end(); ++el) {
@@ -470,22 +470,22 @@ class Ranker {
                         int col = std::max(i, j);
 
                         // hμiμj, hσiσj
-                        hobs(row, col) += count * hμμδ;
-                        hobs(n + row, n + col) -= count * (σ2(i) * σ2(j) / (σδ * σδ) * (hσσδ - gσδ / σδ));
+                        hobs.append_element(row, col, count * hμμδ);
+                        hobs.append_element(n + row, n + col, - count * (σ2(i) * σ2(j) / (σδ * σδ) * (hσσδ - gσδ / σδ)));
 
                         // hμiσi, hμjσi
                         double chσ = count * hμσδ * σ2(i) / σδ;
-                        hobs(i, n + i) -= chσ;
-                        hobs(j, n + i) += chσ;
+                        hobs.append_element(i, n + i, - chσ);
+                        hobs.append_element(j, n + i, chσ);
 
                         // hμiσj, hμjσj
                         chσ = count * hμσδ * σ2(j) / σδ;
-                        hobs(i, n + j) -= chσ;
-                        hobs(j, n + j) += chσ;
+                        hobs.append_element(i, n + j, - chσ);
+                        hobs.append_element(j, n + j, chσ);
                     }
                 }
                 if (compute_hessian)
-                    hessian->obs = hobs;
+                    hessian->obs = std::move(hobs);
 
             }
             if (!val)
@@ -572,10 +572,10 @@ int main(int argc, char ** argv) {
     std::cout << ranker.print_hessian() << std::endl;
     std::cout << *ranker.val << std::endl;
 
-
-    Instance inst = Instance::random(200);
-    obs = Observations(200, inst, 200 * 200 * 10);
-    ranker = Ranker(200);
+    int m = 200;
+    Instance inst = Instance::random(m);
+    obs = Observations(m, inst, m * m* 10);
+    ranker = Ranker(m);
     ranker.fit(obs);
 
     return 0;
