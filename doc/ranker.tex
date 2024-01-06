@@ -1,6 +1,8 @@
 \documentclass[12pt]{article}
 
 \usepackage{amsmath}
+\allowdisplaybreaks
+
 \usepackage[
 backend=biber,
 style=alphabetic,
@@ -198,6 +200,33 @@ $$\log\left(1 + e^{-z}\right) \simeq \int_{\zeta=z}^{\infty} \left(\frac{1}{2} -
 
 The difference between the two is maximal for $z = 0$ and is $\log(2) - \frac{2}{\pi} \simeq 0.0565$. The difference between the derivatives with respect to $z$ is at most $0.0177$.
 
+\subsection{Putting it all together}
+
+The KL part of the divergence that does not depend on the observations is given by
+
+\begin{align*}
+    \begin{split}
+    &-\alpha + \frac{\alpha\beta}{\beta_h} + \alpha_h \log(\beta_h) - \frac{1}{2} n (1 + \log(2 \pi)) + \ln(\beta) + \Gamma(\alpha_h) - \Gamma(\alpha)\\
+    &+ (\alpha - \alpha_h) \psi(\alpha) - (1 + \alpha_h) \ln(\beta) - \left(\sum_{i=0}^{n-1} \ln\sigma_i\right)\\
+    &+ \frac{1}{2} \left(\alpha\beta \left(\sum_{i=0}^{n-1} \mu_i^2 + \sigma_i^2\right) - n (\ln(\beta) + \psi(\alpha) - \log(2 \pi))\right)
+    \end{split}
+    \end{align*}
+
+
+Then to account for all observed trials, we add
+
+\begin{align*}
+    &\sum_{i=0}^{n-1} \sum_{j=0}^{n-1} O_{i,j} \cdot \left( e^{-\frac{\mu_{\delta}^2}{h^2}} \frac{h}{2\sqrt{\pi}} + \mu_{\delta} g_{\mu_\delta} \right) \\
+    \text{where} \\
+    \mu_{\delta} &= \mu_i - \mu_j, \\
+    \sigma_{\delta} &= \sqrt{\sigma_i^2 + \sigma_j^2}, \\
+    h &= \sqrt{\frac{16}{\pi} + 2\sigma_{\delta}^2}, \\
+    g_{\mu_\delta} &= -\frac{1}{2} \left( 1 - \text{erf}\left(\frac{\mu_{\delta}}{h}\right) \right).
+\end{align*}
+
+Note that $O_{i,j}$ may be positive or negative, and at the same time, we may have entries in both $O_{i,j}$ and $O_{j,i}$,
+the reason is that our logistic-normal approximation introduces an asymmetry. If desired, we can split the count
+in half between two cells, or leave half of the matrix unfilled, or use some other criterion to decide where a match should be counted.
 
 
 \subsection{Gradient and Hessian}
