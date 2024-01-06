@@ -184,13 +184,13 @@ $$\int_{z_\delta=-\infty}^{\infty}
 is more problematic. A related integral is the logistic-normal integral,
 
 $$\int_{z_\delta=-\infty}^{\infty}
-\frac{e^{-\frac{1}{2}\left(\frac{z_\delta - (\mu_i - \mu_j)}{\sqrt{\sigma_i^2 + \sigma_j^2}}\right)^2}}{\sqrt{\sigma_i^2 + \sigma_j^2} \sqrt{2 \pi}} \frac{1}{1 + e^{-z_\delta)}}$$
+\frac{e^{-\frac{1}{2}\left(\frac{z_\delta - (\mu_i - \mu_j)}{\sqrt{\sigma_i^2 + \sigma_j^2}}\right)^2}}{\sqrt{\sigma_i^2 + \sigma_j^2} \sqrt{2 \pi}} \frac{1}{1 + e^{-z_\delta}}$$
 
 \cite{crooks2009logistic} offers an approximation by replacing the logistic function with an error function:
 
 $$\frac{1}{1+e^{-z}} \simeq \frac{1}{2} + \frac{1}{2} \text{erf}\left(\frac{\sqrt{\pi}}{4} z\right)$$
 
-Given that $\frac{d}{d z}\log\left(1 + e^{-z}\right) = 1 - \frac{1}{1 + e^{-z}}$ we choose to approximate $\log\left(1 + e^{-z}\right)$
+Given that $$\frac{d}{d z}\log\left(1 + e^{-z}\right) = \frac{1}{1 + e^{-z}} - 1$$ we choose to approximate $\log\left(1 + e^{-z}\right)$
 as
 
 $$\log\left(1 + e^{-z}\right) \simeq \int_{\zeta=z}^{\infty} \left(\frac{1}{2} - \frac{1}{2} \text{erf}\left(\frac{\sqrt{\pi}}{4} \zeta \right)\right)~d\zeta =
@@ -201,14 +201,6 @@ The difference between the two is maximal for $z = 0$ and is $\log(2) - \frac{2}
 
 
 \subsection{Gradient and Hessian}
-
-
-
-
-
-
-
-
 
 
 \printbibliography
