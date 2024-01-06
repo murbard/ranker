@@ -224,9 +224,8 @@ Then to account for all observed trials, we add
     g_{\mu_\delta} &= -\frac{1}{2} \left( 1 - \text{erf}\left(\frac{\mu_{\delta}}{h}\right) \right).
 \end{align*}
 
-Note that $O_{i,j}$ may be positive or negative, and at the same time, we may have entries in both $O_{i,j}$ and $O_{j,i}$,
-the reason is that our logistic-normal approximation introduces an asymmetry. If desired, we can split the count
-in half between two cells, or leave half of the matrix unfilled, or use some other criterion to decide where a match should be counted.
+Note that $O_{i,j}$ is always positive, it represents the number of time $i$ beat $j$. This is not a signed quantity.
+This is indeed important, $i$ beating $j$ and then $j$ beating $i$ over the course of two trials is not the same as no trial at all.
 
 
 \subsection{Gradient and Hessian}
