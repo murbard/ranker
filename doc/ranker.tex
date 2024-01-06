@@ -233,6 +233,40 @@ This is indeed important, $i$ beating $j$ and then $j$ beating $i$ over the cour
 
 These follow directly from the expression in the previous function, please don't make me type them out.
 
+\section{Inference}
+
+We use the Levenberg-Marquardt algorithm to minimize the KL divergence with a Newton-CG algorithm.
+We condition the Hessian using the diagonal.
+
+\section{Loss function}
+
+\subsection{functions}
+The expected number of inversions is fairly simple to compute analytically from the model.
+The entropy of the posterior is not because it collapses into determining any single score with as much
+precisions as possible, at the exclusion of the rest.
+The sum of variances is reasonable.
+
+\subsection{derivative}
+
+These are all easily differentiable with respect to the matrix of observations $o$. In fact we simply
+maintain the derivative of the $mu$ and $sigma$ with respect to the observations, and this lets us
+get the derivative of the loss function with respect to the observations by the chain rule.
+
+So we can pick the top 10 observations that marginally improve the loss function the most. We then compute
+what the expected improvement in the loss with a hypothetical non-infinitesimal observation and pick that.
+
+In fact we can backtrack through possible observations to make using the gradient as a heuristic to search
+the tree.
+
+
+\section*{Conclusion}
+
+This is probably more trouble than it's worth, but it's a fun exercise. The closed form formulas have no business
+working out so simple with the error function approximation, but they do. The inference is very fast which
+means this can scale to many items, or can be used for a deep backtracking search.
+
+This could be extended to more sophisticated models of match outcomes, including the possibility of draws,
+the possibility of more than two players in a match, allowing scores to vary over time  and so on.
 
 \printbibliography
 
