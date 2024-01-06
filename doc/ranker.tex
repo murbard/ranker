@@ -142,7 +142,7 @@ $\alpha_h$ and $\beta_h$. Nonetheless, we naturally initialize $\alpha$ and $\be
 The case of $\sigma_i$ is more complicated. Absent any observation, the distribution of $z_i$ is a Student's distribution with
 infinite variance. We choose to initialize $\sigma_i$ to minimize the KL divergence with that Student distribution. We discovered
 empirically (but did not attempt to prove) that the minimum is reached for
-$$\sigma_i = 1 + \frac{3}{6 \alpha_h + 2 \alpha_h^2 + \mathcal{O}(\alpha_h^3)}$$
+$$\sigma_i = \sqrt{\frac{\beta_h}{\alpha_h}}\left(1 + \frac{3}{6 \alpha_h + 2 \alpha_h^2 + \mathcal{O}(\alpha_h^3)}\right)$$
 
 
 \section{Closed form expression }
