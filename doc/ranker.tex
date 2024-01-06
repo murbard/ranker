@@ -89,11 +89,12 @@ sorting=ynt
         \begin{aligned}
             \nu &\sim \text{InvGamma}(\alpha_h, \beta_h) \\
             \forall i, z_i &\sim \mathcal{N}(0, \nu) \\
-            \forall i, j, \text{o}_{i,j} &\sim \text{Binomial}\left(\frac{1}{1 + e^{-(z_i - z_j)}}, m_{i,j}\right)
+            \forall i < j, o_{i,j} &\sim \text{Binomial}\left(\frac{1}{1 + e^{-(z_i - z_j)}}, m_{i,j}\right) \\
+            \forall i > j, o_{i,j} &= m_{i,j} - o_{j,i} \\
         \end{aligned}
     \end{equation}
     where $\alpha_h$ and $\beta_h$ are hyperparameters, and $\text{o}_{i,j}$ is the outcome of $m_{i,j}$ comparisons
-    between items $i$ and $j$, where $m_{i,j}$ is fixed and given. Note that we use the convention that $\beta_h$ represents
+    between items $i$ and $j$, where $m_{i,j} = m_{j, i}$ is fixed and given. Note that we use the convention that $\beta_h$ represents
     a rate, not a scale. The scale is $1 / \beta_h$.
 
     \subsubsection{Choice of hyperparameters}
@@ -164,13 +165,13 @@ The cross entropy of $Q$ and $P$ is
 
 \begin{multline*}
     H(Q,P) = \int_{\nu=0}^{\infty} \frac{\beta^{-\alpha}\nu^{-\alpha-1}e^{-\frac{1}{\beta \nu}}}{\Gamma(\alpha)}
-\left(\alpha_h \log(\beta_h) + (\alpha+1)\log(\nu) + \frac{1}{\beta \nu} + \log(\Gamma(\alpha))\right)
+\left(\alpha_h \log(\beta_h) + (\alpha+1)\log(\nu) + \frac{1}{\beta \nu} + \log(\Gamma(\alpha))\right) d\nu
 \\
 + \sum_{i=1}^n \int_{\nu=0}^{\infty} \int_{z_i=-\infty}^{\infty} \frac{e^{-\frac{1}{2}\left(\frac{z_i-\mu_i}{\sigma_i}\right)^2}}{\sigma_i \sqrt{2 \pi}} \left(
 \frac{1}{2} \log{2\pi} + \log(\nu) + \frac{1}{2}\frac{z_i^2}{\nu}
 \right)dz_i d\nu\\
-+ \sum_{i=1}^n\sum_{j=1}^n m_{i,j} \int_{z_\delta=-\infty}^{\infty}
-\frac{e^{-\frac{1}{2}\left(\frac{z_\delta - (\mu_i - \mu_j)}{\sqrt{\sigma_i^2 + \sigma_j^2}}\right)^2}}{\sqrt{\sigma_i^2 + \sigma_j^2} \sqrt{2 \pi}} \log\left(1 + e^{-z_\delta}\right) z_\delta +
++ \sum_{i=1}^n\sum_{j=1}^n o_{i,j} \int_{z_\delta=-\infty}^{\infty}
+\frac{e^{-\frac{1}{2}\left(\frac{z_\delta - (\mu_i - \mu_j)}{\sqrt{\sigma_i^2 + \sigma_j^2}}\right)^2}}{\sqrt{\sigma_i^2 + \sigma_j^2} \sqrt{2 \pi}} \log\left(1 + e^{-z_\delta}\right) dz_\delta +
 Cst
 \end{multline*}
 
@@ -216,7 +217,7 @@ The KL part of the divergence that does not depend on the observations is given 
 Then to account for all observed trials, we add
 
 \begin{align*}
-    &\sum_{i=0}^{n-1} \sum_{j=0}^{n-1} O_{i,j} \cdot \left( e^{-\frac{\mu_{\delta}^2}{h^2}} \frac{h}{2\sqrt{\pi}} + \mu_{\delta} g_{\mu_\delta} \right) \\
+    &\sum_{i=0}^{n-1} \sum_{j=0}^{n-1} o_{i,j} \cdot \left( e^{-\frac{\mu_{\delta}^2}{h^2}} \frac{h}{2\sqrt{\pi}} + \mu_{\delta} g_{\mu_\delta} \right) \\
     \text{where} \\
     \mu_{\delta} &= \mu_i - \mu_j, \\
     \sigma_{\delta} &= \sqrt{\sigma_i^2 + \sigma_j^2}, \\
@@ -224,7 +225,7 @@ Then to account for all observed trials, we add
     g_{\mu_\delta} &= -\frac{1}{2} \left( 1 - \text{erf}\left(\frac{\mu_{\delta}}{h}\right) \right).
 \end{align*}
 
-Note that $O_{i,j}$ is always positive, it represents the number of time $i$ beat $j$. This is not a signed quantity.
+Note that $o_{i,j}$ is always positive, it represents the number of time $i$ beat $j$. This is not a signed quantity.
 This is indeed important, $i$ beating $j$ and then $j$ beating $i$ over the course of two trials is not the same as no trial at all.
 
 
