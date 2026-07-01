@@ -11,8 +11,11 @@ from matplotlib import pyplot as plt
 # from .utils import condest
 
 import warnings
-warnings.filterwarnings("error")
-from line_profiler import LineProfiler
+warnings.filterwarnings("error", category=RuntimeWarning)   # fit() relies on RuntimeWarning -> exception for its λ backoff
+try:
+    from line_profiler import LineProfiler   # optional dev dependency (used only for profiling)
+except ImportError:
+    LineProfiler = None
 
 try:
     from scipy.special import log_expit
@@ -22,6 +25,44 @@ except ImportError:
 
 def almost_log_expit(x):
     return - 2 * exp(- π * x**2 / 16) / π + x / 2 * erfc(sqrt(π) * x / 4)
+
+# --- correction to the error-function approximation of the logistic-normal integral ---
+# The erf approximation of log(1+e^{-z}) has worst error ~0.0565.  We add a small correction
+#     corr(z) = sum_i CORR_C[i] (1 + CORR_A[i] z^2) exp(-CORR_A[i] z^2)
+# fit (python/fit_correction.py) so that approx+corr matches log(1+e^{-z}) to ~3e-7 (k=5).
+# Each term still integrates against a Gaussian in closed form, so the objective/gradient/Hessian
+# stay closed-form.  Switching k is purely a matter of replacing these two arrays (k = len).
+CORR_A = array([0.04802229968, 0.08966847198, 0.1575268951, 0.252698338, 0.4630803829])
+CORR_C = array([0.0007259888421, 0.00854921256, 0.02779792245, 0.017919263, 0.001535080506])
+
+def correction(μδ, σδ, order=2):
+    """Correction to  ∫ N(μδ, σδ²) log(1+e^{-z}) dz  and its derivatives, summed over the k terms.
+    Returns (T, dT/dμδ, dT/dσδ, d²T/dμδ², d²T/dμδdσδ, d²T/dσδ²) in the SAME (μδ, σδ) convention as
+    the erf-approx kernels gμδ/gσδ/hμμδ/hμσδ/hσσδ, so they simply add together.
+    order=0 returns only T (derivatives 0) for the value-only path."""
+    s = σδ * σδ; μ = μδ
+    if order == 0:
+        T = 0.0
+        for a, c in zip(CORR_A, CORR_C):
+            D = 1 + 2*a*s
+            T += c*exp(-a*μ*μ/D)/sqrt(D)*(1 + a*μ*μ/(D*D) + a*s/D)
+        return T, 0.0, 0.0, 0.0, 0.0, 0.0
+    T = Tμ = Ts = Tμμ = Tμs = Tss = 0.0          # derivatives wrt μ and s = σδ²
+    for a, c in zip(CORR_A, CORR_C):
+        D = 1 + 2*a*s; E = exp(-a*μ*μ/D); P = c*E/sqrt(D); B = 1 + a*μ*μ/(D*D) + a*s/D
+        Pμ = P*(-2*a*μ/D); R = -a/D + 2*a*a*μ*μ/(D*D); Ps = P*R
+        Pμμ = P*(4*a*a*μ*μ/(D*D) - 2*a/D); Rs = 2*a*a/(D*D) - 8*a**3*μ*μ/(D**3); Pss = P*(R*R + Rs)
+        Pμs = Ps*(-2*a*μ/D) + P*4*a*a*μ/(D*D)
+        Bμ = 2*a*μ/(D*D); Bs = a/(D*D) - 4*a*a*μ*μ/(D**3); Bμμ = 2*a/(D*D)
+        Bμs = -8*a*a*μ/(D**3); Bss = -4*a*a/(D**3) + 24*a**3*μ*μ/(D**4)
+        T += P*B
+        Tμ += Pμ*B + P*Bμ
+        Ts += Ps*B + P*Bs
+        Tμμ += Pμμ*B + 2*Pμ*Bμ + P*Bμμ
+        Tμs += Pμs*B + Pμ*Bs + Ps*Bμ + P*Bμs
+        Tss += Pss*B + 2*Ps*Bs + P*Bss
+    # convert the s = σδ² derivatives to σδ:  d/dσδ = 2σδ d/ds,  d²/dσδ² = 4s d²/ds² + 2 d/ds
+    return T, Tμ, Ts*2*σδ, Tμμ, Tμs*2*σδ, 4*s*Tss + 2*Ts
 
 rng = np.random.default_rng(12345)
 
@@ -81,7 +122,10 @@ class Model():
         """
         Computes the entropy of the prior distribution over instances of the model.
         """
-        return invgamma.entropy(self.α, scale=1/self.β) + norm.entropy(scale=sqrt(self.v)) * self.n
+        # prior over instances: v ~ InvGamma(α, 1/β), z_i | v ~ N(0, v).  Joint differential entropy
+        # H(v) + n·E_v[H(N(0,v))], with E_v[log v] = -log β - ψ(α) for v ~ InvGamma(α, scale=1/β).
+        E_log_v = - log(self.β) - polygamma(0, self.α)
+        return invgamma.entropy(self.α, scale=1/self.β) + self.n * 0.5 * (log(2 * π) + 1 + E_log_v)
 
     def rvs(self):
         """
@@ -98,10 +142,13 @@ class Model():
         :param expit_approx: whether to use the approximation of the logit function
         """
 
+        # obs is a coo_matrix of counts: obs[i, j] = number of times i beat j
+        z = np.asarray(instance.z)
+        δ = z[obs.row] - z[obs.col]
         if expit_approx:
-            expit_val = almost_log_expit(array([instance.z[o[0]] - instance.z[o[1]] for o in obs])).sum()
+            expit_val = (obs.data * almost_log_expit(δ)).sum()
         else:
-            expit_val = log_expit([instance.z[o[0]] - instance.z[o[1]] for o in obs]).sum()
+            expit_val = (obs.data * log_expit(δ)).sum()
 
         return expit_val +  invgamma(self.α, scale=1/self.β).logpdf(instance.v) + norm(loc=0, scale=sqrt(instance.v)).logpdf(instance.z).sum()
 
@@ -151,8 +198,7 @@ class Instance():
         :param i: the first item
         :param j: the second item
         """
-        p = expit(self.z[i] - self.z[j])
-        return rng.rand() < expit(self.z[i] - self.z[j])
+        return rng.random() < expit(self.z[i] - self.z[j])
 
 
 class GradientHessian():
@@ -416,8 +462,9 @@ class VBayes():
                     σδ = sqrt(σ[i]**2 + σ[j]**2)
                     μδ = μ[i] - μ[j]
                     h = sqrt(16/π + 2 * σδ**2)
-                    gμδ = - 1 / 2 * (1 - erf(μδ / h)) # negative
-                    gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h)  # negative, but this is subtracted so, so this makes σ smaller
+                    _, tμ, tσ, _, _, _ = correction(μδ, σδ)
+                    gμδ = - 1 / 2 * (1 - erf(μδ / h)) + tμ # gμδ stores +dF/dμδ
+                    gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h) - tσ  # gσδ stores -dF/dσδ
                     dobs[i, j, 0] = - gσδ  / σδ
                     dobs[i, j, 1] = gμδ
 
@@ -431,12 +478,13 @@ class VBayes():
             μδ = μ[i] - μ[j]
             h = sqrt(16/π + 2 * σδ**2)
 
-            gh.val += count * (exp(-(μδ/h)**2) *  h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h)))
+            Tc, tμ, tσ, tμμ, tμσ, tσσ = correction(μδ, σδ, 2 if compute_gradient else 0)
+            gh.val += count * (exp(-(μδ/h)**2) *  h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h)) + Tc)
 
             if compute_gradient:
 
-                gμδ = - 1 / 2 * (1 - erf(μδ / h)) # negative
-                gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h)  # negative, but this is subtracted so, so this makes σ smaller
+                gμδ = - 1 / 2 * (1 - erf(μδ / h)) + tμ # gμδ stores +dF/dμδ, so + correction
+                gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h) - tσ  # gσδ stores -dF/dσδ, so - correction
 
                 gh.gμ()[i] -= count * (-gμδ)
                 gh.gμ()[j] -= count * gμδ
@@ -447,9 +495,9 @@ class VBayes():
 
                 if compute_hessian:
 
-                    hμμδ = - exp(-(μδ/h)**2) / (sqrt(π) * h)
-                    hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3)
-                    hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + μδ**2)) / (π**(5/2) * h**5)
+                    hμμδ = - exp(-(μδ/h)**2) / (sqrt(π) * h) - tμμ   # h*δ store -d²F, so - correction
+                    hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3) - tμσ
+                    hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + π * μδ**2)) / (π**(5/2) * h**5) - tσσ
 
                     # Diagonal terms, hμiμi, hμjμj, hσiσi, hσjσj
                     gh.h_diag[i] -= count * hμμδ
@@ -508,13 +556,14 @@ class VBayes():
         """
 
         last_val = None
-        for _ in range(max_iter):
-            λ = λ0
+        λ = λ0                       # carried across iterations so the test below sees the damping the
+        for _ in range(max_iter):    # previous step actually needed (it is reset to λ0 after the test)
             gh = self.eval(obs, compute_gradient=True, compute_hessian=True)
             # don't stop if we're still dampening the hessian, but do stop if it's gone too far
-            if last_val and abs(last_val - gh.val)/abs(gh.val) < tol and λ == λ0 or λ > λmax:
+            if (last_val and abs(last_val - gh.val)/abs(gh.val) < tol and λ == λ0) or λ > λmax:
                 break
             last_val = gh.val
+            λ = λ0
 
             # Newton update for the log of positive parameters
             # For that we modify the gradient and the Hessian
@@ -552,7 +601,7 @@ class VBayes():
             while True:
                 try:
                     gh.h_diag *= (1 + λ)
-                    diff = sd * cg(gh.h, gh.g, tol=1e-8, atol=1e-12)[0]
+                    diff = sd * cg(gh.h, gh.g, rtol=1e-8, atol=1e-12)[0]
                     gh.h_diag /= (1 + λ)
 
                     old_params = self.params.copy()
@@ -645,8 +694,9 @@ class VBayes():
                     dinv_dz = - exp(-z**2 / 2) / sqrt(2 * π)
                     dinv_dμi = dinv_dz * sign(μδ) / σδ
                     dinv_dμj = - dinv_dμi
-                    dinv_dσi = - dinv_dz * σ[i] / (σδ**3)
-                    dinv_dσj = - dinv_dz * σ[j] / (σδ**3)
+                    # z = |μδ| / σδ, so dz/dσi = -|μδ| σi / σδ³ (the |μδ| factor was missing)
+                    dinv_dσi = - dinv_dz * abs(μδ) * σ[i] / (σδ**3)
+                    dinv_dσj = - dinv_dz * abs(μδ) * σ[j] / (σδ**3)
                     gradient[i] += dinv_dμi
                     gradient[j] += dinv_dμj
                     gradient[self.n + i] += dinv_dσi
@@ -668,12 +718,11 @@ class VBayes():
         return inversions
 
 
-    def best_pair(self, obs, target='expected_inversions', verify_top=0, possible_pairs=None):
+    def best_pair(self, obs, target='expected_inversions', possible_pairs=None):
         """
         Find the pair of players that would most improve the approximation if matched up against each other.
         :param obs: the observations
         :param target: the target function to optimize, can be 'expected_inversions', or 'variance', or 'entropy'
-        :param verify_top: if > 0, take the top verify_top pairs and compute the metric by simulating the observation instead of just using the gradient
         :param possible_pairs: if not None, only consider these pairs
         """
 
@@ -693,54 +742,32 @@ class VBayes():
             case _:
                 raise ValueError(f"target must be one of {targets}")
 
-        factor = -cg(gh.h, df_dparam, tol=1e-8, atol=1e-12)[0]
+        factor = -cg(gh.h, df_dparam, rtol=1e-8, atol=1e-12)[0]
 
         gains = []
         if possible_pairs is None:
             possible_pairs = [(i, j) for i in range(self.n) for j in range(i+1, self.n)]
 
-        for i,j in possible_pairs:
+        # `gain` is the predicted (tangent) change in the target loss from one comparison,
+        # in expectation over its outcome. We pick the pair that most reduces the loss.
+        #
+        # Caveat (verified empirically): this tangent rule is reliable for the smooth
+        # `sum_of_variances` target. For `expected_inversions` the loss is non-smooth (it has
+        # kinks where two posterior means coincide), so its gradient is a poor guide to the
+        # effect of a finite comparison and greedily minimising it tends to exploit rather than
+        # explore. Prefer `sum_of_variances`, or an exact one-step (secant) look-ahead, for the
+        # inversions target.
+        best_gain, best = np.inf, possible_pairs[0]
+        for i, j in possible_pairs:
             ifwin  = (factor[self.n + i] * self.σ()[i] + factor[self.n + j] * self.σ()[j]) * dobs[i,j,0] + (factor[i] - factor[j]) * dobs[i,j,1]
             iflose = (factor[self.n + j] * self.σ()[j] + factor[self.n + i] * self.σ()[i]) * dobs[j,i,0] + (factor[j] - factor[i]) * dobs[j,i,1]
             p = self.prob_win(i, j)
 
             gain = p * ifwin + (1 - p) * iflose
-            gains.append(array([gain, i, j]))
+            if gain < best_gain:
+                best_gain, best = gain, (i, j)
 
-        gains = array(gains)
-        gains = gains[lexsort(gains.T[::-1])]
-
-        einv = self.expected_inversions()
-        real_gains = zeros(gains.shape)
-        k = 0
-        for i, j in possible_pairs:
-            print(k/len(possible_pairs))
-            # i, j = round(gains[k,1]), round(gains[k,2])
-            old_params = self.params.copy()
-
-            obs.data = append(obs.data, 1)
-            obs.row = append(obs.row, i)
-            obs.col = append(obs.col, j)
-
-            self.fit(verbose=False, obs=obs, tol=1e-6)
-            win = self.expected_inversions()
-            self.params = old_params.copy()
-            obs.row[-1] = j
-            obs.col[-1] = i
-            self.fit(verbose=False, obs=obs, tol=1e-6)
-            lose = self.expected_inversions()
-            self.params = old_params.copy()
-            obs.data = obs.data[:-1]
-            obs.row = obs.row[:-1]
-            obs.col = obs.col[:-1]
-            p = self.prob_win(i, j)
-            real_gains[k,0] = p * win + (1 - p) * lose - einv
-            real_gains[k,1] = i
-            real_gains[k,2] = j
-            k = k + 1
-
-        gains = gains[lexsort(gains.T[::-1])]
-        return gains
+        return best
 
 
 def test():
@@ -755,7 +782,7 @@ def test():
     plt.axis([-5, 5, -5, 5])
 
     for _ in range(2000):
-        (i,j) = v.best_pair(obs, verify_top=10)
+        (i,j) = v.best_pair(obs)
         print(i,j, v.expected_inversions(), v.actual_inversions(instance))
         if instance.match(i,j):
             obs[i,j] += 1

@@ -36,6 +36,47 @@ using namespace boost::math;
 const double Mα = 1.2;
 const double Mβ = 2.0;
 
+// --- correction to the erf approximation of the logistic-normal integral ---
+// corr(z) = sum_i CORR_C[i] (1 + CORR_A[i] z^2) exp(-CORR_A[i] z^2) makes approx+corr match
+// log(1+e^{-z}) to ~3e-7 (k=5), and each term still integrates against a Gaussian in closed form.
+// Switching k is purely a matter of replacing these arrays (k = CORR_K). See python/fit_correction.py.
+const int CORR_K = 5;
+const double CORR_A[CORR_K] = {0.04802229968, 0.08966847198, 0.1575268951, 0.252698338, 0.4630803829};
+const double CORR_C[CORR_K] = {0.0007259888421, 0.00854921256, 0.02779792245, 0.017919263, 0.001535080506};
+
+// Correction to  ∫ N(μδ, σδ²) log(1+e^{-z}) dz  and its derivatives wrt (μδ, σδ), summed over terms.
+// Same (μδ, σδ) convention as the erf kernels gμδ/gσδ/hμμδ/hμσδ/hσσδ, so they simply add.
+// order==0 fills only T.
+inline void correction(double μδ, double σδ, int order,
+                       double& T, double& tμ, double& tσ, double& tμμ, double& tμσ, double& tσσ) {
+    double s = σδ*σδ, μ = μδ;
+    T = tμ = tσ = tμμ = tμσ = tσσ = 0.0;
+    if (order == 0) {
+        for (int k = 0; k < CORR_K; k++) {
+            double a = CORR_A[k], c = CORR_C[k], D = 1 + 2*a*s;
+            T += c*exp(-a*μ*μ/D)/sqrt(D)*(1 + a*μ*μ/(D*D) + a*s/D);
+        }
+        return;
+    }
+    double Tμ = 0, Ts = 0, Tμμ = 0, Tμs = 0, Tss = 0;   // derivatives wrt μ and s = σδ²
+    for (int k = 0; k < CORR_K; k++) {
+        double a = CORR_A[k], c = CORR_C[k];
+        double D = 1 + 2*a*s, E = exp(-a*μ*μ/D), P = c*E/sqrt(D), B = 1 + a*μ*μ/(D*D) + a*s/D;
+        double Pμ = P*(-2*a*μ/D), R = -a/D + 2*a*a*μ*μ/(D*D), Ps = P*R;
+        double Pμμ = P*(4*a*a*μ*μ/(D*D) - 2*a/D), Rs = 2*a*a/(D*D) - 8*a*a*a*μ*μ/(D*D*D), Pss = P*(R*R + Rs);
+        double Pμs = Ps*(-2*a*μ/D) + P*4*a*a*μ/(D*D);
+        double Bμ = 2*a*μ/(D*D), Bs = a/(D*D) - 4*a*a*μ*μ/(D*D*D), Bμμ = 2*a/(D*D);
+        double Bμs = -8*a*a*μ/(D*D*D), Bss = -4*a*a/(D*D*D) + 24*a*a*a*μ*μ/(D*D*D*D);
+        T   += P*B;
+        Tμ  += Pμ*B + P*Bμ;
+        Ts  += Ps*B + P*Bs;
+        Tμμ += Pμμ*B + 2*Pμ*Bμ + P*Bμμ;
+        Tμs += Pμs*B + Pμ*Bs + Ps*Bμ + P*Bμs;
+        Tss += Pss*B + 2*Ps*Bs + P*Bss;
+    }
+    tμ = Tμ; tσ = Ts*2*σδ; tμμ = Tμμ; tμσ = Tμs*2*σδ; tσσ = 4*s*Tss + 2*Ts;
+}
+
 // boost variate generator
 typedef boost::mt19937 RNGType;
 typedef boost::random::normal_distribution<> Normal;
@@ -45,7 +86,7 @@ typedef boost::random::gamma_distribution<> Gamma;
 typedef boost::random::variate_generator<RNGType&, Gamma> GammaGen;
 RNGType rng;
 
-GammaGen gammagen(rng, Gamma(Mα, 1.0/  Mβ));
+GammaGen gammagen(rng, Gamma(Mα, Mβ));  // 1/gamma ~ InvGamma(Mα, scale=1/Mβ)
 NormalGen normalgen(rng, Normal(0, 1));
 
 class Instance {
@@ -104,6 +145,8 @@ class Observations {
                 double r = (double)rand() / (double)RAND_MAX;
                 if (r < p) {
                     X(i,j) += 1;
+                } else {
+                    X(j,i) += 1;
                 }
             }
         }
@@ -433,10 +476,14 @@ class Ranker {
                     const double μδ = μ(i) - μ(j);
                     const double μδ_over_h = μδ / h;
                     const double exp_minus_μδ_over_h_square = exp(-μδ_over_h * μδ_over_h);
-                    const double gμδ = - 0.5 * (1 - erf(μδ_over_h));
-                    const double gσδ = - exp_minus_μδ_over_h_square * σδ / sqrt_π_h;
+                    double Tc, tμ, tσ, tμμ, tμσ, tσσ;
+                    correction(μδ, σδ, compute_gradient ? 2 : 0, Tc, tμ, tσ, tμμ, tμσ, tσσ);
+                    const double gμδ = - 0.5 * (1 - erf(μδ_over_h)) + tμ;   // gμδ stores +dF/dμδ
+                    const double gσδ = - exp_minus_μδ_over_h_square * σδ / sqrt_π_h - tσ;  // gσδ stores -dF/dσδ
 
-                    v += count * (exp_minus_μδ_over_h_square * h / (2 * sqrt(M_PI)) + μδ * gμδ);
+                    // F_erf + correction; write F_erf explicitly rather than reuse the augmented gμδ
+                    v += count * (exp_minus_μδ_over_h_square * h / (2 * sqrt(M_PI))
+                                  - 0.5 * μδ * (1 - erf(μδ_over_h)) + Tc);
 
                     if (compute_gradient) {
                         // Compute gradient
@@ -455,10 +502,10 @@ class Ranker {
                         //    hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3)
                         //    hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + μδ**2)) / (π**(5/2) * h**5)
 
-                        const double hμμδ = - exp_minus_μδ_over_h_square / sqrt_π_h;
-                        const double hμσδ = 2 * μδ * σδ * exp_minus_μδ_over_h_square / (sqrt(M_PI) * h * h * h);
+                        const double hμμδ = - exp_minus_μδ_over_h_square / sqrt_π_h - tμμ;
+                        const double hμσδ = 2 * μδ * σδ * exp_minus_μδ_over_h_square / (sqrt(M_PI) * h * h * h) - tμσ;
                         double sqrt_π_h5 = sqrt_π_h * sqrt_π_h; sqrt_π_h5 *= sqrt_π_h5; sqrt_π_h5 *= sqrt_π_h;
-                        const double hσσδ = - exp_minus_μδ_over_h_square * (256 + 4 * M_PI * σδ * σδ * (8 + μδ * μδ)) / sqrt_π_h5;
+                        const double hσσδ = - exp_minus_μδ_over_h_square * (256 + 4 * M_PI * σδ * σδ * (8 + M_PI * μδ * μδ)) / sqrt_π_h5 - tσσ;
 
                         // diagonal hessian terms
                         hessian->diag(i) -= count * hμμδ;
@@ -484,24 +531,25 @@ class Ranker {
                         hobs.append_element(j, n + j, chσ);
                     }
                 }
-                if (compute_hessian)
-                    hessian->obs = std::move(hobs);
-
             }
+            if (compute_hessian)
+                hessian->obs = std::move(hobs);   // once, after all observation rows
+
             if (!val)
                 val = optional<double>(v);
             else
                 *val = v;
         }
 
-        void fit(const Observations& obs, const double tol = 1e-8, const int max_iter = 1e6) {
+        void fit(const Observations& obs, const double tol = 1e-8, const int max_iter = 1e6, const bool verbose = false) {
             int k = 0;
+            double last_val = 0; bool have_last = false;
             while (k < max_iter) {
                 evaluate(obs, true, true);
-                // if the gradient is small, we're done
-                if (norm_2(*gradient) < tol) {
-                    break;
-                }
+                // stop on small relative change in the objective (matches python) or tiny gradient
+                if (have_last && std::fabs(last_val - *val) / std::fabs(*val) < tol) break;
+                if (norm_2(*gradient) < tol) break;
+                last_val = *val; have_last = true;
                 bool positive = true;
                 for (int i = 0; i < 2 * n + 2; i++) {
                     if (hessian->diag(i) <= 0) {
@@ -515,6 +563,7 @@ class Ranker {
                 }
                 double λ = 1e-10;
                 Ranker other(n);
+                bool converged = false;
                 do {
                     // cg (hessian, gradient, dx,  1e-10, tol, 1000 * n );
                     // use the ublas cg solver with diagonal preconditioner
@@ -526,58 +575,423 @@ class Ranker {
                         break;
                     } else {
                         λ *= 10;
-                        if (λ > 1e10)
-                            throw std::runtime_error("giving up");
+                        if (λ > 1e10) { converged = true; break; }  // no decreasing step => at optimum
                     }
                 } while (true);
+                if (converged) break;
                 *this = std::move(other);
-                std::cout << "iter: " << k << ", val:" << *val << ", λ: " << λ << std::endl;
+                if (verbose) std::cout << "iter: " << k << ", val:" << *val << ", λ: " << λ << std::endl;
                 k++;
             }
         }
 };
 
-/// @brief
-/// @param argc
-/// @param argv
-/// @return
-int main(int argc, char ** argv) {
+// ===================== acquisition strategies (LINEAR domain) =====================
+#include <cmath>
+#include <fstream>
+#include <thread>
+#include <chrono>
+#include <boost/math/special_functions/polygamma.hpp>
 
-    const int n = 3;
+static const double GHx[21] = {-7.8493828951138225, -6.7514447187174609, -5.8293820073044715, -4.9949639447820253, -4.2143439816884216, -3.4698466904753764, -2.7505929810523733, -2.0491024682571628, -1.3597658232112302, -0.67804569244064405, 0, 0.67804569244064405, 1.3597658232112302, 2.0491024682571628, 2.7505929810523733, 3.4698466904753764, 4.2143439816884216, 4.9949639447820253, 5.8293820073044715, 6.7514447187174609, 7.8493828951138225};
+static const double GHw[21] = {2.0989912195656709e-14, 4.975368604121718e-11, 1.4506612844930856e-08, 1.2253548361482524e-06, 4.2192347425516618e-05, 0.00070804779548153682, 0.0064396970514087751, 0.03395272978654286, 0.10839228562641948, 0.21533371569505969, 0.27026018357287701, 0.21533371569505969, 0.10839228562641948, 0.03395272978654286, 0.0064396970514087751, 0.00070804779548153682, 4.2192347425516618e-05, 1.2253548361482524e-06, 1.4506612844930856e-08, 4.975368604121718e-11, 2.0989912195656709e-14};
 
-    // initialize ublas vector to {0.1, -0.2, 0.3, log(1.1), log(2.2), log(3.3), log(1.5), log(3.0)}
-    ublas::vector<double> params(2 * n + 2);
-    params <<= 0.1, -0.2, 0.3, log(1.1), log(2.2), log(3.3), log(1.5), log(3.0);
-    Ranker ranker(n, params);
+// extract linear params from a log-domain Ranker
+static void extract(const ublas::vector<double>& p, int n, std::vector<double>& mu, std::vector<double>& sg, double& al, double& be) {
+    mu.resize(n); sg.resize(n);
+    for (int i = 0; i < n; i++) { mu[i] = p(i); sg[i] = exp(p(n + i)); }
+    al = exp(p(2 * n)); be = exp(p(2 * n + 1));
+}
+
+static int actual_inversions(const std::vector<double>& mu, const std::vector<double>& z, int n) {
+    int inv = 0;
+    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++)
+        if ((mu[i] - mu[j]) * (z[i] - z[j]) <= 0) inv++;
+    return inv;
+}
+
+static double prob_win(const std::vector<double>& mu, const std::vector<double>& sg, int i, int j) {
+    double m = mu[i] - mu[j];
+    double s2 = sg[i] * sg[i] + sg[j] * sg[j];
+    return 0.5 * (1.0 + std::erf(sqrt(M_PI) * m / (4.0 * sqrt(1.0 + M_PI * s2 / 8.0))));
+}
+
+// expected number of inversions + (optional) gradient wrt (mu,sigma) [FIXED |mu_delta| version]
+static double expected_inversions(const std::vector<double>& mu, const std::vector<double>& sg, int n, double* grad) {
+    double inv = 0;
+    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
+        double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
+        double md = mu[i] - mu[j];
+        double z = fabs(md) / sd;
+        inv += 0.5 * erfc(z / sqrt(2.0));
+        if (grad) {
+            double dinv_dz = -exp(-z * z / 2.0) / sqrt(2.0 * M_PI);
+            double sgn = (md > 0) ? 1.0 : ((md < 0) ? -1.0 : 0.0);
+            double dmi = dinv_dz * sgn / sd;
+            grad[i] += dmi; grad[j] -= dmi;
+            grad[n + i] += -dinv_dz * fabs(md) * sg[i] / (sd * sd * sd);
+            grad[n + j] += -dinv_dz * fabs(md) * sg[j] / (sd * sd * sd);
+        }
+    }
+    return inv;
+}
+
+static double Hb(double q) { if (q < 1e-12) q = 1e-12; if (q > 1 - 1e-12) q = 1 - 1e-12; return -q * log(q) - (1 - q) * log(1 - q); }
+static double eig_pair(double md, double sd) {
+    double p = 0, al = 0;
+    for (int k = 0; k < 21; k++) { double s = 1.0 / (1.0 + exp(-(md + sd * GHx[k]))); p += GHw[k] * s; al += GHw[k] * Hb(s); }
+    return Hb(p) - al;
+}
+
+// dobs (dense, n*n*2) from mu,sigma
+static void compute_dobs(const std::vector<double>& mu, const std::vector<double>& sg, int n, std::vector<double>& d0, std::vector<double>& d1) {
+    d0.assign(n * n, 0); d1.assign(n * n, 0);
+    for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) {
+        double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
+        double md = mu[i] - mu[j];
+        double h = sqrt(16.0 / M_PI + 2.0 * sd * sd);
+        double T, tμ, tσ, tμμ, tμσ, tσσ; correction(md, sd, 1, T, tμ, tσ, tμμ, tμσ, tσσ);
+        double gmd = -0.5 * (1.0 - std::erf(md / h)) + tμ;
+        double gsd = -exp(-(md / h) * (md / h)) * sd / (sqrt(M_PI) * h) - tσ;
+        d0[i * n + j] = -gsd / sd;
+        d1[i * n + j] = gmd;
+    }
+}
+
+// build dense LINEAR-domain Hessian H (N x N, N=2n+2), porting models.py eval(compute_hessian)
+static void build_Hlin(const std::vector<double>& mu, const std::vector<double>& sg, double al, double be,
+                       const Observations& obs, int n, std::vector<double>& H) {
+    using boost::math::polygamma;
+    int N = 2 * n + 2;
+    H.assign((size_t)N * N, 0.0);
+    auto A = [&](int r, int c) -> double& { return H[(size_t)r * N + c]; };
+    double albe = al * be;
+    double sum_m2s2 = 0; for (int i = 0; i < n; i++) sum_m2s2 += mu[i] * mu[i] + sg[i] * sg[i];
+    // analytic diagonal
+    for (int i = 0; i < n; i++) { A(i, i) += albe; A(n + i, n + i) += 1.0 / (sg[i] * sg[i]) + albe; }
+    A(2 * n, 2 * n)     += polygamma(1, al) + (1 + al) * polygamma(2, al)   // entropy
+                         - (1 + Mα) * polygamma(2, al)                       // cross IG
+                         - 0.5 * n * polygamma(2, al);                       // gaussian
+    A(2 * n + 1, 2 * n + 1) += -1.0 / (be * be) + (1 + Mα) / (be * be) + n / (2.0 * be * be);
+    // alpha-beta coupling
+    double hab = 1.0 / Mβ + 0.5 * sum_m2s2;
+    A(2 * n, 2 * n + 1) += hab; A(2 * n + 1, 2 * n) += hab;
+    // mu/sigma <-> alpha/beta
+    for (int i = 0; i < n; i++) {
+        A(i, 2 * n) += be * mu[i];     A(2 * n, i) += be * mu[i];
+        A(i, 2 * n + 1) += al * mu[i]; A(2 * n + 1, i) += al * mu[i];
+        A(n + i, 2 * n) += be * sg[i];     A(2 * n, n + i) += be * sg[i];
+        A(n + i, 2 * n + 1) += al * sg[i]; A(2 * n + 1, n + i) += al * sg[i];
+    }
+    // observation terms
+    for (auto it = obs.X.begin1(); it != obs.X.end1(); ++it)
+        for (auto el = it.begin(); el != it.end(); ++el) {
+            int i = el.index1(), j = el.index2();
+            if (i == j) continue;
+            double count = *el;
+            double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
+            double md = mu[i] - mu[j];
+            double h = sqrt(16.0 / M_PI + 2.0 * sd * sd);
+            double e = exp(-(md / h) * (md / h));
+            double Tc, tμ, tσ, tμμ, tμσ, tσσ; correction(md, sd, 2, Tc, tμ, tσ, tμμ, tμσ, tσσ);
+            double gsd = -e * sd / (sqrt(M_PI) * h) - tσ;
+            double hmm = -e / (sqrt(M_PI) * h) - tμμ;
+            double hms = 2.0 * md * sd * e / (sqrt(M_PI) * h * h * h) - tμσ;
+            double hss = -e * (256.0 + 4.0 * M_PI * sd * sd * (8.0 + M_PI * md * md)) / (pow(M_PI, 2.5) * pow(h, 5)) - tσσ;
+            // diagonal (subtracted)
+            A(i, i)         -= count * hmm;
+            A(j, j)         -= count * hmm;
+            A(n + i, n + i) -= count * (hss * (sg[i] / sd) * (sg[i] / sd) + gsd * sg[j] * sg[j] / (sd * sd * sd));
+            A(n + j, n + j) -= count * (hss * (sg[j] / sd) * (sg[j] / sd) + gsd * sg[i] * sg[i] / (sd * sd * sd));
+            // off-diagonal entries (each added symmetrically: H[r][c]+=v, H[c][r]+=v)
+            int lo = std::min(i, j), hi = std::max(i, j);
+            auto sym = [&](int r, int c, double v) { A(r, c) += v; A(c, r) += v; };
+            sym(lo, hi, count * hmm);
+            sym(n + lo, n + hi, -count * (hss * sg[i] * sg[j] / (sd * sd) - gsd * sg[i] * sg[j] / (sd * sd * sd)));
+            sym(i, n + i, -count * hms * sg[i] / sd);
+            sym(i, n + j, -count * hms * sg[j] / sd);
+            sym(j, n + i,  count * hms * sg[i] / sd);
+            sym(j, n + j,  count * hms * sg[j] / sd);
+        }
+}
+
+// solve H y = b (dense, Gaussian elimination w/ partial pivot); returns y
+static std::vector<double> dense_solve(std::vector<double> H, std::vector<double> b, int N) {
+    auto A = [&](int r, int c) -> double& { return H[(size_t)r * N + c]; };
+    for (int col = 0; col < N; col++) {
+        int piv = col; double best = fabs(A(col, col));
+        for (int r = col + 1; r < N; r++) if (fabs(A(r, col)) > best) { best = fabs(A(r, col)); piv = r; }
+        if (piv != col) { for (int c = 0; c < N; c++) std::swap(A(col, c), A(piv, c)); std::swap(b[col], b[piv]); }
+        double d = A(col, col);
+        for (int r = 0; r < N; r++) if (r != col) {
+            double f = A(r, col) / d;
+            if (f != 0.0) { for (int c = col; c < N; c++) A(r, c) -= f * A(col, c); b[r] -= f * b[col]; }
+        }
+    }
+    for (int i = 0; i < N; i++) b[i] /= A(i, i);
+    return b;
+}
+
+// factor = -H_lin^{-1} df  for a given df (length N)
+static std::vector<double> acq_factor(const std::vector<double>& mu, const std::vector<double>& sg, double al, double be,
+                                      const Observations& obs, int n, const std::vector<double>& df) {
+    int N = 2 * n + 2;
+    std::vector<double> H; build_Hlin(mu, sg, al, be, obs, n, H);
+    std::vector<double> y = dense_solve(H, df, N);
+    for (auto& v : y) v = -v;
+    return y;
+}
+
+// select pair for var/inv strategies
+static std::pair<int,int> select_factor_based(const std::vector<double>& mu, const std::vector<double>& sg, double al, double be,
+                                              const Observations& obs, int n, bool inv_target) {
+    int N = 2 * n + 2;
+    std::vector<double> df(N, 0.0);
+    if (inv_target) expected_inversions(mu, sg, n, df.data());
+    else for (int i = 0; i < n; i++) df[n + i] = 2.0 * sg[i];
+    std::vector<double> factor = acq_factor(mu, sg, al, be, obs, n, df);
+    std::vector<double> d0, d1; compute_dobs(mu, sg, n, d0, d1);
+    double best = 1e300; std::pair<int,int> bp(0, 1);
+    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
+        double ifw = (factor[n + i] * sg[i] + factor[n + j] * sg[j]) * d0[i * n + j] + (factor[i] - factor[j]) * d1[i * n + j];
+        double ifl = (factor[n + j] * sg[j] + factor[n + i] * sg[i]) * d0[j * n + i] + (factor[j] - factor[i]) * d1[j * n + i];
+        double p = prob_win(mu, sg, i, j);
+        double g = p * ifw + (1 - p) * ifl;
+        if (g < best) { best = g; bp = {i, j}; }
+    }
+    return bp;
+}
+
+static std::pair<int,int> select_eig(const std::vector<double>& mu, const std::vector<double>& sg, int n) {
+    double best = -1e300; std::pair<int,int> bp(0, 1);
+    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
+        double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
+        double e = eig_pair(mu[i] - mu[j], sd);
+        if (e > best) { best = e; bp = {i, j}; }
+    }
+    return bp;
+}
+
+// ---- LOG-domain native acquisition: reuses the fit's log-domain Hessian (rk.hessian) + cg ----
+// gain df/do is coordinate-invariant, so this yields the same selected pair & gain as Python's linear domain.
+// Requires rk to be at a fitted optimum (so H_log == S H_lin S on the invariants).
+static std::pair<int,int> select_logdomain(Ranker& rk, const Observations& obs, int n, bool inv_target, double* out_gain = nullptr, std::vector<double>* out_factor = nullptr) {
+    int N = 2 * n + 2;
+    rk.evaluate(obs, true, true);  // populate log-domain gradient + Hessian at current params
+    std::vector<double> mu, sg; double al, be; extract(rk.params, n, mu, sg, al, be);
+    vector<double> negdf(N); for (int k = 0; k < N; k++) negdf(k) = 0.0;
+    if (inv_target) {
+        std::vector<double> g(N, 0.0); expected_inversions(mu, sg, n, g.data());
+        for (int i = 0; i < n; i++) { negdf(i) = -g[i]; negdf(n + i) = -(sg[i] * g[n + i]); }
+    } else {
+        for (int i = 0; i < n; i++) negdf(n + i) = -(2.0 * sg[i] * sg[i]);
+    }
+    vector<double> factor = rk.hessian->cg(negdf, 0.0, 1e-10, 1000 * n);
+    if (out_factor) { out_factor->resize(N); for (int k = 0; k < N; k++) (*out_factor)[k] = factor(k); }
+    double best = 1e300; std::pair<int,int> bp(0, 1);
+    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
+        double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
+        double md = mu[i] - mu[j];
+        double h = sqrt(16.0 / M_PI + 2.0 * sd * sd);
+        double T, tμ, tσ, tμμ, tμσ, tσσ; correction(md, sd, 1, T, tμ, tσ, tμμ, tμσ, tσσ);   // win uses μδ=md
+        double Tl, tμl, tσl, a3, a4, a5; correction(-md, sd, 1, Tl, tμl, tσl, a3, a4, a5);   // lose uses μδ=-md
+        double gmd  = -0.5 * (1.0 - std::erf(md / h)) + tμ;    // win: i beats j
+        double gmd2 = -0.5 * (1.0 - std::erf(-md / h)) + tμl;  // lose: j beats i
+        double gsd  = -exp(-(md / h) * (md / h)) * sd / (sqrt(M_PI) * h) - tσ;  // tσ even in md
+        double sig_part = -(gsd / sd) * (factor(n + i) * sg[i] * sg[i] + factor(n + j) * sg[j] * sg[j]);
+        double ifwin  = (factor(i) - factor(j)) * gmd  + sig_part;
+        double iflose = (factor(j) - factor(i)) * gmd2 + sig_part;
+        double p = prob_win(mu, sg, i, j);
+        double g = p * ifwin + (1 - p) * iflose;
+        if (g < best) { best = g; bp = {i, j}; }
+    }
+    if (out_gain) *out_gain = best;
+    return bp;
+}
+
+// initial sigma per VBayes.__init__
+static double init_sigma() { return sqrt(Mβ / Mα) * (1.0 + 3.0 / (6.0 * Mα + 2.0 * Mα * Mα)); }
+
+// ----- verify2: fit the n=6 reference obs, then check the FITTED-state reference (log-native) -----
+static int verify2() {
+    int n = 6;
+    ublas::vector<double> p(2 * n + 2);
+    double s0 = init_sigma();
+    for (int i = 0; i < n; i++) { p(i) = 0.0; p(n + i) = log(s0); }
+    p(2 * n) = log(Mα); p(2 * n + 1) = log(Mβ);
+    Ranker rk(n, p);
     Observations obs(n);
-    obs.X(0, 2) = 2.0;
-    obs.X(1, 2) = 2.0;
-    obs.X(2, 0) = 3.0;
-    obs.X(1, 0) = 1.0;
+    int O[9][3] = {{0,1,3},{1,0,1},{2,3,2},{0,4,2},{4,5,1},{5,2,2},{3,1,1},{2,5,2},{4,0,1}};
+    for (auto& o : O) obs.X(o[0], o[1]) = o[2];
+    rk.fit(obs);
+    std::vector<double> mu, sg; double al, be; extract(rk.params, n, mu, sg, al, be);
+    std::vector<double> z = {0.4, -0.6, 0.05, 1.0, -0.3, 0.5};
+    std::cout.precision(8); std::cout << std::fixed;
+    std::cout << "mu="; for (double v : mu) std::cout << v << " "; std::cout << "\n";
+    std::cout << "sigma="; for (double v : sg) std::cout << v << " "; std::cout << "\n";
+    std::cout << "alpha=" << al << " beta=" << be << "\n";
+    std::cout << "actual_inversions=" << actual_inversions(mu, z, n) << "\n";
+    std::cout << "prob_win(0,1)=" << prob_win(mu, sg, 0, 1) << "  prob_win(2,3)=" << prob_win(mu, sg, 2, 3) << "\n";
+    std::cout << "expected_inversions=" << expected_inversions(mu, sg, n, nullptr) << "\n";
+    std::cout << "EIG(0,1)=" << eig_pair(mu[0]-mu[1], sqrt(sg[0]*sg[0]+sg[1]*sg[1]))
+              << "  EIG(2,3)=" << eig_pair(mu[2]-mu[3], sqrt(sg[2]*sg[2]+sg[3]*sg[3]));
+    auto ep = select_eig(mu, sg, n); std::cout << "  EIG selected pair=(" << ep.first << "," << ep.second << ")\n";
+    for (int tgt = 0; tgt < 2; tgt++) {
+        double gain; std::vector<double> fac;
+        auto bp = select_logdomain(rk, obs, n, tgt == 1, &gain, &fac);
+        std::cout << (tgt ? "inv" : "var") << ": factor_mu[:6]=";
+        for (int i = 0; i < n; i++) std::cout << fac[i] << " ";
+        std::cout << " selected=(" << bp.first << "," << bp.second << ") gain=" << gain << "\n";
+    }
+    return 0;
+}
 
-    ranker.evaluate(obs, true, true);
+// ----- verify mode: reproduce python reference values on the fixed n=6 state -----
+static int verify() {
+    int n = 6;
+    ublas::vector<double> p(2 * n + 2);
+    double mu0[6] = {0.30, -0.50, 0.10, 0.80, -0.20, 0.40};
+    double sg0[6] = {0.50, 0.70, 0.45, 0.90, 0.60, 0.55};
+    for (int i = 0; i < n; i++) { p(i) = mu0[i]; p(n + i) = log(sg0[i]); }
+    p(2 * n) = log(1.5); p(2 * n + 1) = log(2.5);
+    Observations obs(n);
+    obs.X(0, 1) = 3; obs.X(1, 0) = 1; obs.X(2, 3) = 2; obs.X(0, 4) = 2; obs.X(4, 5) = 1; obs.X(5, 2) = 2; obs.X(3, 1) = 1;
+    std::vector<double> mu, sg; double al, be; extract(p, n, mu, sg, al, be);
+    std::vector<double> z = {0.4, -0.6, 0.05, 1.0, -0.3, 0.5};
+    std::cout.precision(6); std::cout << std::fixed;
+    std::cout << "inversions = " << actual_inversions(mu, z, n) << "\n";
+    std::cout << "prob_win(0,1) = " << prob_win(mu, sg, 0, 1) << "  prob_win(2,3) = " << prob_win(mu, sg, 2, 3) << "\n";
+    std::vector<double> g(2 * n + 2, 0.0);
+    std::cout << "expected_inversions = " << expected_inversions(mu, sg, n, g.data()) << "\n";
+    std::cout << "Einv grad ="; for (double v : g) std::cout << " " << v; std::cout << "\n";
+    std::cout << "EIG(0,1) = " << eig_pair(mu[0] - mu[1], sqrt(sg[0]*sg[0]+sg[1]*sg[1])) << "\n";
+    std::cout << "EIG(2,3) = " << eig_pair(mu[2] - mu[3], sqrt(sg[2]*sg[2]+sg[3]*sg[3])) << "\n";
+    std::vector<double> d0, d1; compute_dobs(mu, sg, n, d0, d1);
+    std::cout << "dobs[0,1] = " << d0[0*n+1] << " " << d1[0*n+1] << "  dobs[1,0] = " << d0[1*n+0] << " " << d1[1*n+0] << "\n";
+    for (int tgt = 0; tgt < 2; tgt++) {
+        std::vector<double> df(2*n+2, 0.0);
+        if (tgt == 1) expected_inversions(mu, sg, n, df.data());
+        else for (int i = 0; i < n; i++) df[n+i] = 2.0 * sg[i];
+        std::vector<double> factor = acq_factor(mu, sg, al, be, obs, n, df);
+        std::pair<int,int> bp = select_factor_based(mu, sg, al, be, obs, n, tgt == 1);
+        // recompute best gain for print
+        std::vector<double> dd0, dd1; compute_dobs(mu, sg, n, dd0, dd1);
+        double best = 1e300;
+        for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
+            double ifw = (factor[n+i]*sg[i]+factor[n+j]*sg[j])*dd0[i*n+j] + (factor[i]-factor[j])*dd1[i*n+j];
+            double ifl = (factor[n+j]*sg[j]+factor[n+i]*sg[i])*dd0[j*n+i] + (factor[j]-factor[i])*dd1[j*n+i];
+            double pp = prob_win(mu, sg, i, j); double gg = pp*ifw+(1-pp)*ifl; if (gg<best) best=gg;
+        }
+        std::cout << (tgt ? "inv" : "var") << ": factor[:4]=" << factor[0] << " " << factor[1] << " " << factor[2] << " " << factor[3]
+                  << " selected_pair=(" << bp.first << ", " << bp.second << ") best_gain=" << best << "\n";
+    }
+    return 0;
+}
 
-    // print all parts of the gradient and hessian
-    std::cout << ranker.print_gradient() << std::endl;
-    std::cout << ranker.print_hessian() << std::endl;
+// ----- one experiment run; fills traj[strat][step] for this run -----
+static const int MAXSTEPS = 2048;   // trajectory buffer size; steps must not exceed this
+static void run_once(int n, int steps, unsigned long seed, double traj[4][MAXSTEPS]) {
+    RNGType rng(seed);
+    // v ~ InvGamma(Mα, scale=1/Mβ)  <=>  1/v ~ Gamma(shape=Mα, scale=Mβ)
+    GammaGen gg(rng, Gamma(Mα, Mβ));
+    NormalGen ng(rng, Normal(0, 1));
+    boost::uniform_01<RNGType&> unif(rng);
+    // instance
+    double v = 1.0 / gg();
+    std::vector<double> z(n);
+    for (int i = 0; i < n; i++) z[i] = ng() * sqrt(v);
+    double s0 = init_sigma();
+    for (int strat = 0; strat < 4; strat++) {  // 0 random,1 eig,2 var,3 inv
+        Observations obs(n);
+        ublas::vector<double> p(2 * n + 2);
+        for (int i = 0; i < n; i++) { p(i) = 0.0; p(n + i) = log(s0); }
+        p(2 * n) = log(Mα); p(2 * n + 1) = log(Mβ);
+        Ranker rk(n, p);
+        for (int t = 0; t < steps; t++) {
+            rk.fit(obs);
+            std::vector<double> mu, sg; double al, be; extract(rk.params, n, mu, sg, al, be);
+            traj[strat][t] += actual_inversions(mu, z, n);
+            int i, j;
+            if (strat == 0) { i = (int)(unif() * n); do { j = (int)(unif() * n); } while (j == i); }
+            else if (strat == 1) { auto pr = select_eig(mu, sg, n); i = pr.first; j = pr.second; }
+            else { auto pr = select_logdomain(rk, obs, n, strat == 3); i = pr.first; j = pr.second; }
+            double pij = 1.0 / (1.0 + exp(-(z[i] - z[j])));
+            if (unif() < pij) obs.X(i, j) += 1; else obs.X(j, i) += 1;
+        }
+    }
+}
 
-    // fit
-    ranker.fit(obs);
+int main(int argc, char ** argv) {
+    std::string mode = argc > 1 ? argv[1] : "verify";
+    if (mode == "verify") return verify();
+    if (mode == "verify2") return verify2();
+    if (mode == "n3test") {
+        const int n = 3;
+        ublas::vector<double> params(2 * n + 2);
+        params <<= 0.1, -0.2, 0.3, log(1.1), log(2.2), log(3.3), log(1.5), log(3.0);
+        Ranker ranker(n, params);
+        Observations obs(n);
+        obs.X(0, 2) = 2.0; obs.X(1, 2) = 2.0; obs.X(2, 0) = 3.0; obs.X(1, 0) = 1.0;
+        ranker.fit(obs, 1e-8, 1e6, false);
+        std::cout << "n=3 converged val = " << *ranker.val << " (expect 6.08618 with correction)\n";
+        return 0;
+    }
+    if (mode == "bench") {   // bench <n> <comparisons> : time a single fit
+        int nb = argc > 2 ? atoi(argv[2]) : 200;
+        int count = argc > 3 ? atoi(argv[3]) : 160000;
+        Instance inst = Instance::random(nb);
+        Observations obs(nb, inst, count);
+        ublas::vector<double> params(2 * nb + 2);
+        for (int i = 0; i < nb; i++) { params(i) = 0.0; params(nb + i) = 0.0; }  // mu=0, ln sigma=0
+        params(2 * nb) = log(1.2); params(2 * nb + 1) = log(2.0);                  // ln alpha, ln beta
+        Ranker ranker(nb, params);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        ranker.fit(obs, 1e-8, 1e6, false);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double secs = std::chrono::duration<double>(t1 - t0).count();
+        std::cout << "n=" << nb << " comparisons=" << count << " nnz=" << obs.X.nnz()
+                  << "  fit " << secs << " s\n";
+        return 0;
+    }
+    // experiment mode: experiment <n> <steps> <nruns> <seed0> <outfile>
+    int n = argc > 2 ? atoi(argv[2]) : 12;
+    int steps = argc > 3 ? atoi(argv[3]) : 500;
+    if (steps > MAXSTEPS) { std::cerr << "steps " << steps << " exceeds MAXSTEPS " << MAXSTEPS << "\n"; return 1; }
+    int nruns = argc > 4 ? atoi(argv[4]) : 300;
+    unsigned long seed0 = argc > 5 ? strtoul(argv[5], 0, 10) : 1;
+    std::string outfile = argc > 6 ? argv[6] : "experiment_out.csv";
 
+    static double sum[4][MAXSTEPS];
+    for (int s = 0; s < 4; s++) for (int t = 0; t < MAXSTEPS; t++) sum[s][t] = 0;
 
+    int nthreads = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> pool;
+    std::vector<std::vector<std::vector<double>>> tls(nthreads, std::vector<std::vector<double>>(4, std::vector<double>(MAXSTEPS, 0.0)));
+    std::atomic<int> done(0);
+    auto worker = [&](int tid) {
+        for (int r = tid; r < nruns; r += nthreads) {
+            static thread_local double tr[4][MAXSTEPS];
+            for (int s = 0; s < 4; s++) for (int t = 0; t < MAXSTEPS; t++) tr[s][t] = 0;
+            run_once(n, steps, seed0 + 1000003UL * (unsigned long)r, tr);
+            for (int s = 0; s < 4; s++) for (int t = 0; t < steps; t++) tls[tid][s][t] += tr[s][t];
+            done++;
+        }
+    };
+    for (int t = 0; t < nthreads; t++) pool.emplace_back(worker, t);
+    for (auto& th : pool) th.join();
+    for (int tid = 0; tid < nthreads; tid++) for (int s = 0; s < 4; s++) for (int t = 0; t < steps; t++) sum[s][t] += tls[tid][s][t];
 
-
-    ranker.evaluate(obs, true, true);
-    std::cout << ranker.print_gradient() << std::endl;
-    std::cout << ranker.print_hessian() << std::endl;
-    std::cout << *ranker.val << std::endl;
-
-    int m = 200;
-    Instance inst = Instance::random(m);
-    obs = Observations(m, inst, m * m* 10);
-    ranker = Ranker(m);
-    ranker.fit(obs);
-
+    const char* names[4] = {"random", "eig", "var", "inv"};
+    std::ofstream f(outfile);
+    f << "step,random,eig,var,inv\n";
+    for (int t = 0; t < steps; t++) { f << t; for (int s = 0; s < 4; s++) f << "," << sum[s][t] / nruns; f << "\n"; }
+    f.close();
+    std::cout.precision(3); std::cout << std::fixed;
+    for (int s = 0; s < 4; s++) {
+        double final = sum[s][steps-1] / nruns, auc = 0; for (int t = 0; t < steps; t++) auc += sum[s][t] / nruns; auc /= steps;
+        std::cout << names[s] << ": final=" << final << " auc=" << auc << "\n";
+    }
+    std::cout << "runs=" << nruns << " threads=" << nthreads << " -> " << outfile << "\n";
     return 0;
 
 }

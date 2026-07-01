@@ -1,6 +1,11 @@
 \documentclass[12pt]{article}
 
 \usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{float}
+\graphicspath{{figures/}}
 \allowdisplaybreaks
 
 \usepackage[
@@ -14,7 +19,7 @@ sorting=ynt
 
 
 \begin{document}
-\title{Ranker}
+\title{Ranker: Fast Variational Bayesian Ranking\\from Pairwise Comparisons}
 \author{Arthur Breitman}
 \date{October 2022}
 \maketitle
@@ -22,41 +27,125 @@ sorting=ynt
     Ranker is a Bayesian algorithm for ranking items in a set, inspired by the ELO rating
     system in chess. It assumes each item has a latent score, normally distributed
     with a latent variance, and that the outcome of a pairwise comparison is a Bernoulli
-    trial with a probability of success given by the logistic function of the difference.
+    trial with a probability of success given by the logistic function of the difference
+    in scores.
 
     Ranker infers the latent scores of the items and the variance using a variational
-    Bayes approximation which models the posterior as an inverse gamma distributed variance
-    and independent normally distributed scores. We compute the KL-divergence gradient and
-    Hessian in closed-form by approximating the logistic function with the error function.
-    This yields a very fast inference technique, based on the Levenberg-Marquardt algorithm.
+    Bayes approximation which models the posterior as an inverse-gamma distributed variance
+    and independent normally distributed scores. We compute the KL-divergence, its gradient and
+    Hessian in closed form by approximating the logistic function with the error function.
+    This yields a very fast inference technique, based on a damped Newton conjugate-gradient
+    iteration.
 
     Ranker can do more than infer scores and rank items, it can also be used to select the
-    most useful pair of items to compare next. We do this efficiently by computing the
-    gradient of our loss function with respect to the observed trials. The entire algorithm
-    runs in $\mathcal{O}(n^2)$ time, where $n$ is the number of items.
+    most useful pair of items to compare next. We do this efficiently by differentiating the
+    fitted posterior with respect to the observed trials through the implicit function theorem.
+    A single inference, and a single round of next-pair selection, both run in $\mathcal{O}(n^2)$
+    time, where $n$ is the number of items. We validate the approximation against a reference
+    Markov-chain Monte Carlo posterior.
 \end{abstract}
 
 \section{Introduction}
-    Ranker is a Bayesian algorithm for ranking items in a set, inspired by the ELO rating
-    system in chess. It assumes each item has a latent score, normally distributed
-    with a latent variance, and that the outcome of a pairwise comparison is a Bernoulli
-    trial with a probability of success given by the logistic function of the difference.
+    Ranking a set of items from pairwise comparisons is a recurring problem: rating chess
+    players from game outcomes, ordering products from A/B preferences, or eliciting a
+    person's taste by repeatedly asking them ``which of these two do you prefer?''. Two
+    questions arise. First, given a collection of noisy comparisons, what is the best estimate
+    of the underlying ranking, and how confident are we in it? Second --- and this is what makes
+    the interactive setting interesting --- which comparison should we ask for next so as to
+    learn the most?
 
-    Ranker infers the latent scores of the items and the variance using a variational
-    Bayes approximation which models the posterior as an inverse gamma distributed variance
-    and independent normally distributed scores. We compute the KL-divergence gradient and
-    Hessian in closed-form by approximating the logistic function with the error function.
-    This yields a very fast inference technique, based on the Levenberg-Marquardt algorithm.
+    Ranker answers both. It is a Bayesian model in which each item carries a latent
+    score, scores share a latent variance drawn from an inverse-gamma prior, and the outcome of
+    a comparison is a Bernoulli trial whose success probability is the logistic function of the
+    score difference. This is the Bradley--Terry model \cite{bradley1952rank} with a
+    hierarchical Gaussian prior on the scores.
 
-    Ranker can do more than infer scores and rank items, it can also be used to select the
-    most useful pair of items to compare next. We do this efficiently by computing the
-    gradient of our loss function with respect to the observed trials. The entire algorithm
-    runs in $\mathcal{O}(n^2)$ time, where $n$ is the number of items.
+    Exact inference in this model is intractable, so we use a mean-field variational Bayes
+    approximation \cite{blei2017variational}: the posterior is approximated by an inverse-gamma
+    distribution over the variance and a product of independent Gaussians over the scores. The
+    contribution of this note is that, by replacing the logistic link with a closely matched
+    error-function surrogate, \emph{every} term of the KL divergence --- including its gradient
+    and Hessian --- can be written in closed form using elementary and polygamma functions. The
+    resulting objective is minimized with a damped Newton conjugate-gradient iteration whose
+    Hessian-vector products cost $\mathcal{O}(n + \mathrm{nnz}(o))$ --- linear in the number of items
+    and observed pairs --- thanks to the sparsity structure of the problem.
+
+    The same closed form makes active learning cheap. Because the fitted parameters are a
+    smooth function of the observation counts, we differentiate them with respect to a
+    hypothetical comparison through the implicit function theorem and pick the pair whose
+    outcome is expected to most improve a chosen criterion. This is a form of Bayesian optimal
+    experimental design, specialised to pairwise comparisons; empirically, uncertainty-directed
+    criteria (information gain or posterior variance) select comparisons more efficiently than
+    greedily minimising the ranking loss itself, which is myopic.
+
+    Our contributions are:
+    \begin{itemize}
+        \item a closed-form mean-field variational objective for hierarchical Bradley--Terry,
+              obtained through an error-function approximation of the logistic-normal integral
+              \cite{crooks2009logistic} (Sections~\ref{sec:closedform});
+        \item the sparse gradient/Hessian structure that makes one inference cost
+              $\mathcal{O}(n^2)$ (Section~\ref{sec:gradhess});
+        \item a differentiable next-pair selection rule for active comparison
+              (Section~\ref{sec:active}); and
+        \item an empirical validation against an exact-model MCMC reference, and a comparison of
+              acquisition criteria for active pair selection (Section~\ref{sec:experiments}).
+    \end{itemize}
+
+\section{Related work}
+    The Bradley--Terry model \cite{bradley1952rank} is the canonical model of paired
+    comparisons; \cite{10.1214/aos/1079120141} gives efficient MM algorithms for its maximum
+    likelihood estimation and its generalisations. The ELO system \cite{elo1978rating} is an
+    online point-update heuristic for the same likelihood, and Glicko \cite{glickman1999glicko}
+    augments it with a rating-reliability term, taking a step towards a Bayesian treatment.
+    BayesElo applies Maximum a Posteriori estimation on top of the Bradley--Terry likelihood.
+
+    The closest relative of Ranker is TrueSkill \cite{herbrich2007trueskill}, a Bayesian skill
+    rating system that maintains a Gaussian belief over each player's skill and updates it by
+    approximate message passing (expectation propagation) on a factor graph. Ranker differs in
+    three respects: it places a shared hierarchical prior with an \emph{inferred} variance over
+    the scores rather than fixing a per-player prior; it uses a global mean-field variational
+    objective minimized to convergence rather than a single online pass; and it exposes the
+    fitted posterior as a differentiable function of the data, which is what enables the
+    active next-pair selection. The error-function approximation to the logistic-normal
+    integral we rely on is due to Crooks \cite{crooks2009logistic}.
+
+\subsection{Comparison with P\'olya--Gamma augmentation}
+    The standard route to Bayesian inference in logistic and Bradley--Terry models is
+    P\'olya--Gamma data augmentation \cite{polson2013bayesian}: one introduces an auxiliary
+    P\'olya--Gamma variable for each compared pair, conditional on which the logistic likelihood
+    becomes Gaussian in the scores. The resulting conjugacy gives simple closed-form updates and
+    underlies both Gibbs samplers and mean-field variational schemes for these models. Ranker takes
+    a different route --- replacing the logistic link by an error-function surrogate rather than
+    augmenting it --- with three practical consequences.
+
+    First, there are no augmentation variables to infer. P\'olya--Gamma carries one latent variable
+    per compared pair, which must be resampled (Gibbs) or mean-field averaged (variational) at every
+    sweep, and whose mean-field treatment is an extra factorisation layered on top of the one over
+    the scores. The surrogate removes it entirely: the observations enter only through the fixed
+    count matrix $o$, and the variational family is over the scores and the shared variance alone,
+    giving the low-dimensional closed-form objective of Section~\ref{sec:closedform}.
+
+    Second, that objective, its gradient, and its Hessian are all closed form, so it is minimised
+    with a damped Newton conjugate-gradient iteration --- converging in a handful of second-order
+    steps --- rather than the first-order coordinate updates that augmentation-based variational
+    inference relies on, which mix slowly under the coupling of the hierarchical prior.
+
+    Third, the augmentation-free objective makes the fitted posterior a smooth, differentiable
+    function of the observation counts, which is exactly what enables the active next-pair selection
+    of Section~\ref{sec:active} by differentiating through the fit. Under a P\'olya--Gamma treatment
+    the objective is defined only after the auxiliary variables are integrated or averaged out, so
+    differentiating the fit with respect to the data is far less direct.
+
+    The price is a controlled approximation: a P\'olya--Gamma Gibbs sampler is asymptotically exact,
+    whereas the error-function surrogate is not. As Section~\ref{sec:correction} shows, however, its
+    error can be made arbitrarily small with a fast-converging sequence of corrections, at which point
+    the mean-field factorisation --- which any variational scheme, P\'olya--Gamma included, must also
+    make --- is the dominant approximation, not the link.
 
 \section{Background}
-    Ranker is inspired by the ELO rating system in chess. In chess, each player has a rating
-    which is a positive integer. The rating of a player is a measure of their skill,
-    and it is updated after each game. Each player's rating is updated according to the
+    Ranker is inspired by the ELO rating system in chess \cite{elo1978rating}. In chess, each
+    player has a rating which is a positive integer. The rating of a player is a measure of their
+    skill, and it is updated after each game. Each player's rating is updated according to the
     following formula:
     \begin{equation}
         R_{new} = R_{old} + K(S - E)
@@ -84,7 +173,9 @@ sorting=ynt
 \subsection{Model}
     Ranker assumes that each item has a latent score, normally distributed with a latent
     variance. The outcome of a pairwise comparison is a Bernoulli trial with a probability
-    of success given by the logistic function of the difference. The model is as follows:
+    of success given by the logistic function of the difference. We write $\mathcal{N}(\mu,
+    \sigma^2)$ for the normal distribution of mean $\mu$ and \emph{variance} $\sigma^2$. The
+    model is as follows:
     \begin{equation}
         \begin{aligned}
             \nu &\sim \text{InvGamma}(\alpha_h, \beta_h) \\
@@ -93,24 +184,26 @@ sorting=ynt
             \forall i > j, o_{i,j} &= m_{i,j} - o_{j,i} \\
         \end{aligned}
     \end{equation}
-    where $\alpha_h$ and $\beta_h$ are hyperparameters, and $\text{o}_{i,j}$ is the outcome of $m_{i,j}$ comparisons
-    between items $i$ and $j$, where $m_{i,j} = m_{j, i}$ is fixed and given. Note that we use the convention that $\beta_h$ represents
-    a rate, not a scale. The scale is $1 / \beta_h$.
+    where $\alpha_h$ and $\beta_h$ are hyperparameters, and $o_{i,j}$ is the number of wins of item $i$ over item $j$
+    out of $m_{i,j}$ comparisons between items $i$ and $j$, where $m_{i,j} = m_{j, i}$ is fixed and given.
+    Note that here $\nu$ is the \emph{variance} of the scores. We use the convention that $\beta_h$ represents
+    a rate, not a scale: the inverse-gamma density is
+    $p(\nu) = \frac{\beta_h^{\alpha_h}}{\Gamma(\alpha_h)} \nu^{-\alpha_h-1} e^{-\beta_h/\nu}$, so the scale is $1 / \beta_h$.
 
     \subsubsection{Choice of hyperparameters}
     We pick concrete values for the hyperparameters $\alpha_h = 1.2$ and $\beta_h = 2$
-    A handwavy justification for these values follows.
+    (equivalently, scale $1/\beta_h = 0.5$). A hand-wavy justification for these values follows.
 
     Consider the binomial distribution over 10 stars, obtained by flipping a coin
     ten times and summing the number of heads. It has a standard deviation of
-    $\sqrt{5/2} \simeq 1.5811$. The difference between two adjacent start ratings is thus
+    $\sqrt{5/2} \simeq 1.5811$. The difference between two adjacent star ratings is thus
     $\sqrt{2/5} \simeq 0.6325$. Based on this intuition, we call a difference of $\sqrt{2/5}$ standard deviations
-    a "star" of difference.
+    a ``star'' of difference.
 
-    Assuming this is an intuitive notion of a "star", what odds
-    should an additional star confer to an item in a heads up match?
+    Assuming this is an intuitive notion of a ``star'', what odds
+    should an additional star confer to an item in a head-to-head match?
     If those comparisons are hard to judge and very subjective, maybe only 55\% of the time?
-    If they're very clear, perhaps over 95\% of the time?
+    If they're very clear, perhaps over 99\% of the time?
 
     Using a logistic rule:
     \begin{itemize}
@@ -118,67 +211,73 @@ sorting=ynt
     \item 99\% would correspond to a standard deviation of $\sqrt{5/2} \log(19) \simeq 4.656$
     \end{itemize}
 
-    None of this is very rigorous, but it gives use some sense of the scale
-    of standard deviations we're dealing with. Clearly 0.0001 and 100 are silly.
+    None of this is very rigorous, but it gives us some sense of the scale
+    of standard deviations we're dealing with. Clearly $0.0001$ and $100$ are silly.
 
     These roughly correspond to the 1\% and 99\% tails of the
-    $\text{InverseGamma}(1.2, 2)$ distribution for the variance and justifies our choice of hyperparameters.
+    $\text{InvGamma}(1.2, 2)$ distribution for the variance, and justify our choice of hyperparameters.
     We are proud to incorporate actual prior knowledge, as opposed
-    to coping out of it by using a so-called ``uninformative" prior :-)
+    to copping out of it by using a so-called ``uninformative'' prior :-)
 
 \subsection{Variational Bayes approximation}
 
-We approximate the posterior with a factorized distribution.
+We approximate the posterior with a factorized (mean-field) distribution $Q$,
 
 \begin{equation}
     \begin{aligned}
         \nu &\sim \text{InvGamma}(\alpha, \beta) \\
-        \forall i, z_i &\sim \mathcal{N}(\mu_i, \sigma_i) \\
+        \forall i, z_i &\sim \mathcal{N}(\mu_i, \sigma_i^2) \\
     \end{aligned}
 \end{equation}
 
+so that $\sigma_i$ is the standard deviation of the marginal over $z_i$.
 Note that $\alpha$ and $\beta$ are parameters of the approximation to the posterior, not the hyperparameters of the model, which are
 $\alpha_h$ and $\beta_h$. Nonetheless, we naturally initialize $\alpha$ and $\beta$ to $\alpha_h$ and $\beta_h$. We initialize $\mu_i$ to $0$.
-The case of $\sigma_i$ is more complicated. Absent any observation, the distribution of $z_i$ is a Student's distribution with
-infinite variance. We choose to initialize $\sigma_i$ to minimize the KL divergence with that Student distribution. We discovered
-empirically (but did not attempt to prove) that the minimum is reached for
-$$\sigma_i = \sqrt{\frac{\beta_h}{\alpha_h}}\left(1 + \frac{3}{6 \alpha_h + 2 \alpha_h^2 + \mathcal{O}(\alpha_h^3)}\right)$$
+The case of $\sigma_i$ is more delicate. Absent any observation, the marginal distribution of $z_i$ is a Student's $t$ distribution with
+$2 \alpha_h$ degrees of freedom and scale $\sqrt{\beta_h / \alpha_h}$. We choose to initialize $\sigma_i$ to minimize the KL divergence between
+the Gaussian marginal and that Student distribution. We discovered empirically (but did not attempt to prove) that the minimum is reached, to
+leading order in $1/\alpha_h$, for
+$$\sigma_i = \sqrt{\frac{\beta_h}{\alpha_h}}\left(1 + \frac{3}{6 \alpha_h + 2 \alpha_h^2} + \mathcal{O}(\alpha_h^{-3})\right).$$
 
 
-\section{Closed form expression }
+\section{Closed-form expression}
+\label{sec:closedform}
 
 \subsection{KL-divergence}
 
-The KL divergence between the true posterior, $P$, and the variational approximation $Q$ is thus $D_{KL}(Q||P) = - H(Q) + H(Q,P)$,
+The KL divergence between the true posterior, $P$, and the variational approximation $Q$ is $D_{KL}(Q\|P) = - H(Q) + H(Q,P)$,
 where $H(Q)$ is the entropy of $Q$ and $H(Q,P)$ is the cross entropy of $Q$ and $P$. The entropy of $Q$ is
 
 \begin{multline*}
-    H(Q) = \int_{\nu=0}^{\infty} \frac{\beta^{-\alpha}\nu^{-\alpha-1}e^{-\frac{1}{\beta \nu}}}{\Gamma(\alpha) }
-    \left(\alpha_h \log(\beta_h) + (\alpha+1)\log(\nu) + \frac{1}{\beta \nu} + \log(\Gamma(\alpha))\right)
+    H(Q) = \int_{\nu=0}^{\infty} \frac{\beta^{-\alpha}\nu^{-\alpha-1}e^{-\frac{1}{\beta \nu}}}{\Gamma(\alpha) } \\
+    \times \left(\alpha \log(\beta) + (\alpha+1)\log(\nu) + \frac{1}{\beta \nu} + \log(\Gamma(\alpha))\right)
     d\nu \\
-    + \sum_{i=1}^n \int_{z_i=-\infty}^{\infty} \frac{e^{-\frac{1}{2}\left(\frac{z_i-\mu_i}{\sigma_i}\right)^2}}{\sigma_i \sqrt{2 \pi}}
-    \left(\frac{1}{2} \log{2\pi} + \log{\sigma_i} + \frac{1}{2}\left(\frac{z_i-\mu_i}{\sigma_i}\right)^2\right) dz_i
+    + \sum_{i=1}^n \int_{z_i=-\infty}^{\infty} \frac{e^{-\frac{1}{2}\left(\frac{z_i-\mu_i}{\sigma_i}\right)^2}}{\sigma_i \sqrt{2 \pi}} \\
+    \times \left(\frac{1}{2} \log{2\pi} + \log{\sigma_i} + \frac{1}{2}\left(\frac{z_i-\mu_i}{\sigma_i}\right)^2\right) dz_i
 \end{multline*}
 
 
 The cross entropy of $Q$ and $P$ is
 
 \begin{multline*}
-    H(Q,P) = \int_{\nu=0}^{\infty} \frac{\beta^{-\alpha}\nu^{-\alpha-1}e^{-\frac{1}{\beta \nu}}}{\Gamma(\alpha)}
-\left(\alpha_h \log(\beta_h) + (\alpha+1)\log(\nu) + \frac{1}{\beta \nu} + \log(\Gamma(\alpha))\right) d\nu
+    H(Q,P) = \int_{\nu=0}^{\infty} \frac{\beta^{-\alpha}\nu^{-\alpha-1}e^{-\frac{1}{\beta \nu}}}{\Gamma(\alpha)} \\
+\times \left(\alpha_h \log(\beta_h) + (\alpha_h+1)\log(\nu) + \frac{1}{\beta_h \nu} + \log(\Gamma(\alpha_h))\right) d\nu
 \\
-+ \sum_{i=1}^n \int_{\nu=0}^{\infty} \int_{z_i=-\infty}^{\infty} \frac{e^{-\frac{1}{2}\left(\frac{z_i-\mu_i}{\sigma_i}\right)^2}}{\sigma_i \sqrt{2 \pi}} \left(
-\frac{1}{2} \log{2\pi} + \log(\nu) + \frac{1}{2}\frac{z_i^2}{\nu}
++ \sum_{i=1}^n \int_{\nu=0}^{\infty} \int_{z_i=-\infty}^{\infty} \frac{e^{-\frac{1}{2}\left(\frac{z_i-\mu_i}{\sigma_i}\right)^2}}{\sigma_i \sqrt{2 \pi}} \frac{\beta^{-\alpha}\nu^{-\alpha-1}e^{-\frac{1}{\beta \nu}}}{\Gamma(\alpha)} \\
+\times \left(
+\frac{1}{2} \log{2\pi} + \frac{1}{2}\log(\nu) + \frac{1}{2}\frac{z_i^2}{\nu}
 \right)dz_i d\nu\\
 + \sum_{i=1}^n\sum_{j=1}^n o_{i,j} \int_{z_\delta=-\infty}^{\infty}
-\frac{e^{-\frac{1}{2}\left(\frac{z_\delta - (\mu_i - \mu_j)}{\sqrt{\sigma_i^2 + \sigma_j^2}}\right)^2}}{\sqrt{\sigma_i^2 + \sigma_j^2} \sqrt{2 \pi}} \log\left(1 + e^{-z_\delta}\right) dz_\delta +
-Cst
+\frac{e^{-\frac{1}{2}\left(\frac{z_\delta - (\mu_i - \mu_j)}{\sqrt{\sigma_i^2 + \sigma_j^2}}\right)^2}}{\sqrt{\sigma_i^2 + \sigma_j^2} \sqrt{2 \pi}} \\
+\times \log\left(1 + e^{-z_\delta}\right) dz_\delta + Cst
 \end{multline*}
+
+The constant $Cst$ collects the normalising terms that do not depend on the variational parameters; it does not affect the minimiser.
 
 
 \subsection{The logistic-normal integral}
 
-As it turns out, we can express most of the integrals above in terms of elementary functions, as well as the polygamma function $\Psi$.
+As it turns out, we can express most of the integrals above in terms of elementary functions, as well as the polygamma function $\psi$.
 The integral
 
 $$\int_{z_\delta=-\infty}^{\infty}
@@ -187,37 +286,111 @@ $$\int_{z_\delta=-\infty}^{\infty}
 is more problematic. A related integral is the logistic-normal integral,
 
 $$\int_{z_\delta=-\infty}^{\infty}
-\frac{e^{-\frac{1}{2}\left(\frac{z_\delta - (\mu_i - \mu_j)}{\sqrt{\sigma_i^2 + \sigma_j^2}}\right)^2}}{\sqrt{\sigma_i^2 + \sigma_j^2} \sqrt{2 \pi}} \frac{1}{1 + e^{-z_\delta}}$$
+\frac{e^{-\frac{1}{2}\left(\frac{z_\delta - (\mu_i - \mu_j)}{\sqrt{\sigma_i^2 + \sigma_j^2}}\right)^2}}{\sqrt{\sigma_i^2 + \sigma_j^2} \sqrt{2 \pi}} \frac{1}{1 + e^{-z_\delta}}\, dz_\delta.$$
 
 \cite{crooks2009logistic} offers an approximation by replacing the logistic function with an error function:
 
-$$\frac{1}{1+e^{-z}} \simeq \frac{1}{2} + \frac{1}{2} \text{erf}\left(\frac{\sqrt{\pi}}{4} z\right)$$
+$$\frac{1}{1+e^{-z}} \simeq \frac{1}{2} + \frac{1}{2} \text{erf}\left(\frac{\sqrt{\pi}}{4} z\right).$$
 
-Given that $$\frac{d}{d z}\log\left(1 + e^{-z}\right) = \frac{1}{1 + e^{-z}} - 1$$ we choose to approximate $\log\left(1 + e^{-z}\right)$
+Given that $$\frac{d}{d z}\log\left(1 + e^{-z}\right) = \frac{1}{1 + e^{-z}} - 1,$$ we choose to approximate $\log\left(1 + e^{-z}\right)$
 as
 
 $$\log\left(1 + e^{-z}\right) \simeq \int_{\zeta=z}^{\infty} \left(\frac{1}{2} - \frac{1}{2} \text{erf}\left(\frac{\sqrt{\pi}}{4} \zeta \right)\right)~d\zeta =
-\frac{2}{\pi}e^{-\frac{\pi z^2}{16}} - \frac{1}{2} z~\mathrm{erfc}\left(\frac{\sqrt{\pi}}{4} z\right)$$
+\frac{2}{\pi}e^{-\frac{\pi z^2}{16}} - \frac{1}{2} z~\mathrm{erfc}\left(\frac{\sqrt{\pi}}{4} z\right).$$
 
-The difference between the two is maximal for $z = 0$ and is $\log(2) - \frac{2}{\pi} \simeq 0.0565$. The difference between the derivatives with respect to $z$ is at most $0.0177$.
+The difference between the two is maximal for $z = 0$ and is $\log(2) - \frac{2}{\pi} \simeq 0.0565$. The difference between the derivatives with respect to $z$ is at most $0.0177$. Figure~\ref{fig:approx} shows both the function and the error.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\textwidth]{approx.pdf}
+    \caption{Left: the softplus $\log(1+e^{-z})$ and its error-function approximation. Right: the
+    approximation error, which is bounded by $\log(2) - \tfrac{2}{\pi} \simeq 0.0565$ (dotted line)
+    and attained at $z = 0$.}
+    \label{fig:approx}
+\end{figure}
+
+\subsection{Refining the approximation}
+\label{sec:correction}
+
+The error-function approximation is convenient, but an error of $\simeq 0.0565$ is not negligible.
+We can drive it down by orders of magnitude essentially for free, while keeping every integral in
+closed form. The error $r(z) = \log(1+e^{-z}) - \widehat{f}(z)$ of the approximation $\widehat{f}$ is
+an even, non-negative function that peaks at $z = 0$ and decays. We cancel it with a sum of $k$
+Gaussian bumps,
+$$\varepsilon(z) = \sum_{i=1}^{k} c_i \left(1 + a_i z^2\right) e^{-a_i z^2},$$
+each of which \emph{still} integrates against a Gaussian in closed form: for the model's posterior over
+the score difference, $\mathcal{N}(\mu_\delta, \sigma_\delta^2)$, writing $D_i = 1 + 2 a_i \sigma_\delta^2$,
+$$\int \mathcal{N}(z;\mu_\delta,\sigma_\delta^2)\; c_i\,(1 + a_i z^2)\,e^{-a_i z^2}\, dz
+= \frac{c_i}{\sqrt{D_i}}\; e^{-a_i \mu_\delta^2 / D_i}\left(1 + \frac{a_i \mu_\delta^2}{D_i^2} + \frac{a_i \sigma_\delta^2}{D_i}\right).$$
+So the corrected observation term, its gradient, and its Hessian remain elementary closed-form
+expressions (no new special functions, and the same $D + R + S$ sparsity of
+Section~\ref{sec:gradhess}); the correction is simply added to the per-observation kernels.
+
+We fit the coefficients $\{a_i, c_i\}$ to minimize the worst-case (minimax) absolute error of
+$\widehat{f} + \varepsilon$. With the widths $a_i$ fixed the $c_i$ enter linearly, so the minimax fit
+of $c_i$ is a linear program; we search the $k$ widths globally and then refine $(a_i, c_i)$ jointly by
+gradient descent on a smooth $L_p$ surrogate of the (non-smooth) maximum. The fits are also monotone
+improvements --- the corrected error is no larger than the original at \emph{every} $z$.
+Table~\ref{tab:correction} lists the coefficients and worst error for $k = 1, \dots, 7$; each extra term
+cuts the worst error several-fold (about $10\times$ for the first terms, tapering to $\sim\!4\times$ by
+$k = 7$). Figure~\ref{fig:correction} shows the $k = 5$
+case, where the error falls from $0.0565$ to $\simeq 3\times 10^{-7}$ --- five orders of magnitude --- at
+which point the error-function approximation is no longer a meaningful source of error next to the
+mean-field variational approximation itself.
+
+\begin{table}[H]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{c c l l}
+\toprule
+$k$ & worst error & $a_i$ & $c_i$ \\
+\midrule
+    1 & $1.555\!\times\!10^{-3}$ & $1.618\!\times\!10^{-1}$ & $5.497\!\times\!10^{-2}$ \\
+    2 & $1.233\!\times\!10^{-4}$ & $1.028\!\times\!10^{-1}$,\,$2.256\!\times\!10^{-1}$ & $2.052\!\times\!10^{-2}$,\,$3.588\!\times\!10^{-2}$ \\
+    3 & $1.331\!\times\!10^{-5}$ & $7.432\!\times\!10^{-2}$,\,$1.589\!\times\!10^{-1}$,\,$2.970\!\times\!10^{-1}$ & $6.511\!\times\!10^{-3}$,\,$3.585\!\times\!10^{-2}$,\,$1.415\!\times\!10^{-2}$ \\
+    4 & $1.695\!\times\!10^{-6}$ & $5.812\!\times\!10^{-2}$,\,$1.157\!\times\!10^{-1}$,\,$2.039\!\times\!10^{-1}$,\,$3.774\!\times\!10^{-1}$ & $2.110\!\times\!10^{-3}$,\,$1.832\!\times\!10^{-2}$,\,$3.142\!\times\!10^{-2}$,\,$4.673\!\times\!10^{-3}$ \\
+    5 & $2.861\!\times\!10^{-7}$ & $4.802\!\times\!10^{-2}$,\,$8.967\!\times\!10^{-2}$,\,$1.575\!\times\!10^{-1}$,\,$2.527\!\times\!10^{-1}$,\,$4.631\!\times\!10^{-1}$ & $7.260\!\times\!10^{-4}$,\,$8.549\!\times\!10^{-3}$,\,$2.780\!\times\!10^{-2}$,\,$1.792\!\times\!10^{-2}$,\,$1.535\!\times\!10^{-3}$ \\
+    6 & $7.232\!\times\!10^{-8}$ & $3.846\!\times\!10^{-2}$,\,$6.758\!\times\!10^{-2}$,\,$1.143\!\times\!10^{-1}$,\,$1.846\!\times\!10^{-1}$,\,$2.919\!\times\!10^{-1}$,\,$5.191\!\times\!10^{-1}$ & $1.672\!\times\!10^{-4}$,\,$2.907\!\times\!10^{-3}$,\,$1.415\!\times\!10^{-2}$,\,$2.836\!\times\!10^{-2}$,\,$1.020\!\times\!10^{-2}$,\,$7.423\!\times\!10^{-4}$ \\
+    7 & $1.887\!\times\!10^{-8}$ & $3.542\!\times\!10^{-2}$,\,$6.007\!\times\!10^{-2}$,\,$9.706\!\times\!10^{-2}$,\,$1.527\!\times\!10^{-1}$,\,$2.257\!\times\!10^{-1}$,\,$3.568\!\times\!10^{-1}$,\,$6.050\!\times\!10^{-1}$ & $8.874\!\times\!10^{-5}$,\,$1.631\!\times\!10^{-3}$,\,$8.478\!\times\!10^{-3}$,\,$2.184\!\times\!10^{-2}$,\,$2.012\!\times\!10^{-2}$,\,$4.125\!\times\!10^{-3}$,\,$2.470\!\times\!10^{-4}$ \\
+\bottomrule
+\end{tabular}}
+\caption{Correction coefficients fit by minimax, for $k = 1, \dots, 7$ terms. ``Worst error'' is the
+maximum absolute error of $\widehat{f} + \varepsilon$ over $z$. Each added term reduces it several-fold
+($\sim\!10\times$ early, tapering to $\sim\!4\times$ by $k = 7$). In practice we use $k = 5$.}
+\label{tab:correction}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{correction_k5.pdf}
+    \caption{Left: absolute error $|\widehat{f}(z) + \varepsilon(z) - \log(1+e^{-z})|$ of the
+    error-function approximation alone (grey) and after the five-term correction (red), on a logarithmic
+    scale; the dips in the red curve are the zero-crossings of the equioscillating minimax error. Right:
+    the worst absolute error over $z$ against the number of correction terms $k$ ($k = 0$ is the plain
+    error-function approximation), showing the roughly geometric convergence --- each term shrinks the
+    error several-fold.}
+    \label{fig:correction}
+\end{figure}
 
 \subsection{Putting it all together}
 
-The KL part of the divergence that does not depend on the observations is given by
+After carrying out the integrals, the part of the divergence that does not depend on the observations is
 
 \begin{align*}
     \begin{split}
-    &-\alpha + \frac{\alpha\beta}{\beta_h} + \alpha_h \log(\beta_h) - \frac{1}{2} n (1 + \log(2 \pi)) + \ln(\beta) + \Gamma(\alpha_h) - \Gamma(\alpha)\\
-    &+ (\alpha - \alpha_h) \psi(\alpha) - (1 + \alpha_h) \ln(\beta) - \left(\sum_{i=0}^{n-1} \ln\sigma_i\right)\\
-    &+ \frac{1}{2} \left(\alpha\beta \left(\sum_{i=0}^{n-1} \mu_i^2 + \sigma_i^2\right) - n (\ln(\beta) + \psi(\alpha) - \log(2 \pi))\right)
+    &\underbrace{\frac{\alpha\beta}{\beta_h} - \alpha + \alpha_h \log\!\frac{\beta_h}{\beta} + \log\Gamma(\alpha_h) - \log\Gamma(\alpha) + (\alpha - \alpha_h)\,\psi(\alpha)}_{\text{inverse-gamma KL}}\\
+    &\quad + \underbrace{\frac{1}{2}\, \alpha\beta \sum_{i=0}^{n-1} \left(\mu_i^2 + \sigma_i^2\right) - \sum_{i=0}^{n-1} \log\sigma_i - \frac{n}{2}\bigl(1 + \log(\beta) + \psi(\alpha)\bigr)}_{\text{Gaussian KL}}.
     \end{split}
-    \end{align*}
+\end{align*}
+
+The $\tfrac{1}{2}\log 2\pi$ constants of the Gaussian entropy and cross-entropy cancel exactly, which
+is why no $\log 2\pi$ term remains.
 
 
-Then to account for all observed trials, we add
+Then, to account for all observed trials, we add
 
 \begin{align*}
-    &\sum_{i=0}^{n-1} \sum_{j=0}^{n-1} o_{i,j} \cdot \left( e^{-\frac{\mu_{\delta}^2}{h^2}} \frac{h}{2\sqrt{\pi}} + \mu_{\delta} g_{\mu_\delta} \right) \\
+    &\sum_{i=0}^{n-1} \sum_{j=0}^{n-1} o_{i,j} \cdot \left( e^{-\frac{\mu_{\delta}^2}{h^2}} \frac{h}{2\sqrt{\pi}} + \mu_{\delta} g_{\mu_\delta} + \mathbb{E}_{z \sim \mathcal{N}(\mu_\delta, \sigma_\delta^2)}\!\left[\varepsilon(z)\right] \right) \\
     \text{where} \\
     \mu_{\delta} &= \mu_i - \mu_j, \\
     \sigma_{\delta} &= \sqrt{\sigma_i^2 + \sigma_j^2}, \\
@@ -225,48 +398,247 @@ Then to account for all observed trials, we add
     g_{\mu_\delta} &= -\frac{1}{2} \left( 1 - \text{erf}\left(\frac{\mu_{\delta}}{h}\right) \right).
 \end{align*}
 
-Note that $o_{i,j}$ is always positive, it represents the number of time $i$ beat $j$. This is not a signed quantity.
-This is indeed important, $i$ beating $j$ and then $j$ beating $i$ over the course of two trials is not the same as no trial at all.
+The contribution of each observed pair is $o_{i,j}\,\mathbb{E}[\log(1 + e^{-z})]$, where the expectation
+runs over that pair's posterior $z \sim \mathcal{N}(\mu_\delta, \sigma_\delta^2)$; all expectations below
+are over it. The first two terms in the summand are the closed form of this under the
+error-function approximation, and the third is the same expectation of the correction $\varepsilon(z)$ of
+Section~\ref{sec:correction}. Note that $\varepsilon(z)$ is a function of $z$ alone: its dependence on the
+pair, and any coupling between $\mu_\delta$ and $\sigma_\delta$, enters only through the posterior it
+is averaged against, exactly as for the error-function term. In closed form, with
+$D_\ell = 1 + 2 a_\ell \sigma_\delta^2$,
+\begin{align*}
+\mathbb{E}\!\left[\varepsilon(z)\right]
+&= \int \mathcal{N}(z; \mu_\delta, \sigma_\delta^2)\,\varepsilon(z)\,dz \\
+&= \sum_{\ell=1}^{k} \frac{c_\ell}{\sqrt{D_\ell}}\,
+e^{-a_\ell \mu_\delta^2 / D_\ell}\left(1 + \frac{a_\ell \mu_\delta^2}{D_\ell^2} + \frac{a_\ell \sigma_\delta^2}{D_\ell}\right).
+\end{align*}
+Dropping it recovers the plain error-function objective.
+
+Note that $o_{i,j}$ is always positive: it represents the number of times $i$ beat $j$. This is not a signed quantity.
+This is indeed important; $i$ beating $j$ and then $j$ beating $i$ over the course of two trials is not the same as no trial at all.
 
 
 \subsection{Gradient and Hessian}
+\label{sec:gradhess}
 
-These follow directly from the expression in the previous function, please don't make me type them out.
+The gradient and Hessian of the objective with respect to the variational parameters
+$\theta = (\mu_1, \dots, \mu_n, \sigma_1, \dots, \sigma_n, \alpha, \beta)$ follow by direct
+differentiation of the closed form above. Before writing them out it is worth describing their
+\emph{structure}, because that is what makes inference fast. Both split into an
+observation-independent part and a sum of one local contribution per observed pair, and the
+Hessian decomposes as
+$$H = D + R + S,$$
+where:
+\begin{itemize}
+    \item $D$ is diagonal (the observation-independent terms together with the diagonal of the
+          observation terms);
+    \item $R$ is a rank-coupling block confined to the two scale parameters $(\alpha, \beta)$
+          and their interaction with each $(\mu_i, \sigma_i)$ --- i.e. dense only in the last
+          two rows and columns, and of rank at most two there;
+    \item $S$ is sparse, with a constant number of off-diagonal entries
+          ($(\mu_i, \mu_j)$, $(\sigma_i, \sigma_j)$, $(\mu_i, \sigma_j)$, $(\mu_j, \sigma_i)$,
+          $\dots$) per observed pair $o_{i,j} > 0$.
+\end{itemize}
+Consequently a Hessian-vector product $H x$ costs $\mathcal{O}(n + \mathrm{nnz}(o))$, where
+$\mathrm{nnz}(o)$ is the number of observed pairs. We never form $H$ explicitly; we expose it as a
+linear operator and solve $H x = g$ with conjugate gradients (Section~\ref{sec:inference}).
+
+\paragraph{Observation-independent terms.}
+Writing $\psi_1 = \psi'$ for the trigamma function and $\Sigma = \sum_i (\mu_i^2 + \sigma_i^2)$,
+the gradient of the observation-free part is
+\begin{align*}
+    \partial_{\mu_i} &= \alpha\beta\,\mu_i, &
+    \partial_{\sigma_i} &= \alpha\beta\,\sigma_i - \frac{1}{\sigma_i}, \\
+    \partial_{\alpha} &= \frac{\beta}{\beta_h} - 1 + \tfrac{1}{2}\beta\,\Sigma
+        + \left(\alpha - \alpha_h - \tfrac{n}{2}\right)\psi_1(\alpha), &
+    \partial_{\beta} &= \frac{\alpha}{\beta_h} + \tfrac{1}{2}\alpha\,\Sigma
+        - \frac{\alpha_h + \tfrac{n}{2}}{\beta}.
+\end{align*}
+Its Hessian is diagonal in the $(\mu,\sigma)$ block, $\partial^2_{\mu_i} = \alpha\beta$ and
+$\partial^2_{\sigma_i} = \alpha\beta + 1/\sigma_i^2$, with the only couplings being the
+$(\alpha,\beta)$ corner and the rank-two coupling of $(\alpha,\beta)$ to each $\mu_i, \sigma_i$
+(namely $\partial_{\mu_i}\partial_\alpha = \beta\mu_i$, $\partial_{\mu_i}\partial_\beta = \alpha\mu_i$,
+and likewise for $\sigma_i$); these are the blocks $D$ and $R$.
+
+\paragraph{Per-observation terms.}
+Each observed pair contributes $o_{i,j}\,F(\mu_\delta, \sigma_\delta)$ to the objective, with
+$\mu_\delta = \mu_i - \mu_j$, $\sigma_\delta = \sqrt{\sigma_i^2 + \sigma_j^2}$,
+$h = \sqrt{16/\pi + 2\sigma_\delta^2}$, and
+$F = \frac{h}{2\sqrt\pi} e^{-\mu_\delta^2/h^2} - \tfrac{1}{2}\mu_\delta\bigl(1 - \mathrm{erf}(\mu_\delta/h)\bigr)$.
+Its first derivatives in the two natural variables are
+$$F_{\mu_\delta} = -\tfrac{1}{2}\bigl(1 - \mathrm{erf}(\mu_\delta/h)\bigr), \qquad
+F_{\sigma_\delta} = \frac{\sigma_\delta}{\sqrt\pi\, h}\, e^{-\mu_\delta^2/h^2},$$
+and the second derivatives are
+\begin{align*}
+    F_{\mu_\delta\mu_\delta} &= \frac{e^{-\mu_\delta^2/h^2}}{\sqrt\pi\, h}, &
+    F_{\mu_\delta\sigma_\delta} &= -\frac{2\,\mu_\delta\,\sigma_\delta\, e^{-\mu_\delta^2/h^2}}{\sqrt\pi\, h^3}, \\
+    F_{\sigma_\delta\sigma_\delta} &= \frac{\bigl(256 + 4\pi\sigma_\delta^2(8 + \pi\mu_\delta^2)\bigr) e^{-\mu_\delta^2/h^2}}{\pi^{5/2}\, h^5}. &
+\end{align*}
+When the refined approximation of Section~\ref{sec:correction} is used, each of these kernels simply
+gains the corresponding derivative of the correction term --- also a closed-form, elementary expression
+of $(\mu_\delta, \sigma_\delta)$ --- with no change to the structure.
+The entries of $S$ (and the observation part of $D$) then follow by the chain rule through
+$\mu_\delta$ and $\sigma_\delta = \sqrt{\sigma_i^2 + \sigma_j^2}$, using
+$\partial\sigma_\delta/\partial\sigma_i = \sigma_i/\sigma_\delta$,
+$\partial^2\sigma_\delta/\partial\sigma_i^2 = \sigma_j^2/\sigma_\delta^3$, and
+$\partial^2\sigma_\delta/\partial\sigma_i\partial\sigma_j = -\sigma_i\sigma_j/\sigma_\delta^3$; for
+example $\partial_{\mu_i} = -\partial_{\mu_j} = o_{i,j}F_{\mu_\delta}$, while
+$\partial_{\mu_i}^2 = o_{i,j}F_{\mu_\delta\mu_\delta}$ and
+$\partial_{\mu_i}\partial_{\mu_j} = -o_{i,j}F_{\mu_\delta\mu_\delta}$.
 
 \section{Inference}
+\label{sec:inference}
 
-We use the Levenberg-Marquardt algorithm to minimize the KL divergence with a Newton-CG algorithm.
-We condition the Hessian using the diagonal.
+We minimize the KL divergence with a damped Newton conjugate-gradient iteration. At each step
+we solve the Newton system $H x = g$ approximately with conjugate gradients, using the
+Hessian-vector product of Section~\ref{sec:gradhess}, and we precondition with the (Jacobi)
+diagonal of $H$. The positive parameters $\sigma_i, \alpha, \beta$ are updated in the log
+domain so that they remain positive. As in the Levenberg--Marquardt method, we add a damping
+term $\lambda$ to the diagonal and increase $\lambda$ geometrically whenever a step fails to
+decrease the objective, decreasing it again once steps succeed. This combines the fast local
+convergence of Newton's method with the robustness of gradient descent far from the optimum.
 
-\section{Loss function}
+\paragraph{Why conjugate gradients fit this problem so well.}
+The Hessian is exactly of the form a preconditioned conjugate-gradient solver likes best. After
+Jacobi (diagonal) preconditioning, the observation-free part $D + R$ becomes the identity plus a
+rank-two coupling to $(\alpha, \beta)$, and the observation part $S$ adds off-diagonal entries
+along the (typically sparse) comparison graph. The result is a well-conditioned operator whose
+spectrum is tightly clustered around one, with only a handful of outlying eigenvalues from the
+low-rank coupling and the comparison structure. Conjugate gradients converges in a number of
+iterations governed by the number of eigenvalue \emph{clusters}, not by the dimension, so the
+iteration count stays essentially constant as $n$ grows: empirically each Newton solve takes about
+$10$--$12$ conjugate-gradient iterations whether $n = 10$ or $n = 200$, and the damped-Newton
+loop itself converges in fewer than ten steps. Because the method is matrix-free --- it needs only
+the $\mathcal{O}(n + \mathrm{nnz}(o))$ Hessian-vector product and never a factorization --- this
+turns each inference into a small constant number of cheap structured matrix-vector products. The
+same property is what makes active selection cheap: it needs $H^{-1}$ applied to a single vector
+(the loss gradient), which is exactly what one conjugate-gradient solve delivers, and that solve is
+then reused across all candidate pairs (Section~\ref{sec:active}).
 
-\subsection{functions}
-The expected number of inversions is fairly simple to compute analytically from the model.
-The entropy of the posterior is not because it collapses into determining any single score with as much
-precisions as possible, at the exclusion of the rest.
-The sum of variances is reasonable.
+\section{Active pair selection}
+\label{sec:active}
 
-\subsection{derivative}
+\subsection{Acquisition criteria}
+Having a posterior, we can ask which comparison to request next. We consider three criteria computed
+from the fitted posterior:
+\begin{itemize}
+    \item the \emph{expected number of inversions}, i.e. the expected number of pairs whose
+          posterior mean order disagrees with their true order. For a pair $(i,j)$ this is
+          $\tfrac{1}{2}\,\mathrm{erfc}\!\left(|\mu_i - \mu_j| / (\sqrt{2}\,\sigma_\delta)\right)$,
+          and the total is the sum over all pairs. This is the task loss itself, and it is
+          differentiable in $(\mu, \sigma)$; a candidate pair is scored by its expected reduction.
+    \item the \emph{sum of posterior variances} $\sum_i \sigma_i^2$, a simple uncertainty proxy,
+          likewise differentiable and scored by expected reduction.
+    \item the \emph{expected information gain} of the next comparison (the BALD criterion): the mutual
+          information between its binary outcome $y$ and the latent scores,
+          $\mathrm{I}(y; z) = \mathrm{H}[\bar p_{ij}] - \mathbb{E}\!\left[\mathrm{H}[\sigma(z_i - z_j)]\right]$,
+          where $\mathrm{H}[p] = -p\log p - (1-p)\log(1-p)$ is the binary entropy,
+          $\bar p_{ij} = \mathbb{E}[\sigma(z_i - z_j)]$ is the posterior-averaged win probability, and the
+          expectation is over the one-dimensional Gaussian posterior of $z_i - z_j$, evaluated by
+          Gauss--Hermite quadrature. It is \emph{maximised}, and --- unlike the two losses --- it is
+          read off each pair directly rather than through the fit.
+\end{itemize}
 
-These are all easily differentiable with respect to the matrix of observations $o$. In fact we simply
-maintain the derivative of the $mu$ and $sigma$ with respect to the observations, and this lets us
-get the derivative of the loss function with respect to the observations by the chain rule.
+\subsection{Differentiating through the fit}
+At a minimiser the gradient of the objective vanishes, $g(\theta^\star, o) = 0$. By the
+implicit function theorem, the fitted parameters depend smoothly on the observation counts $o$,
+with
+$$\frac{\partial \theta^\star}{\partial o_{i,j}} = - H^{-1} \frac{\partial g}{\partial o_{i,j}},$$
+where $H$ is the same Hessian used for inference and $\partial g / \partial o_{i,j}$ is cheap
+because the objective is linear in $o$. Given a loss $f(\theta)$, the marginal effect of a
+hypothetical observation is then obtained by the chain rule,
+$$\frac{\partial f}{\partial o_{i,j}} = \left(\frac{\partial f}{\partial \theta}\right)^{\!\top} \frac{\partial \theta^\star}{\partial o_{i,j}}
+= - \left(\frac{\partial f}{\partial \theta}\right)^{\!\top} H^{-1} \frac{\partial g}{\partial o_{i,j}}.$$
+A single conjugate-gradient solve of $H^{-1} \partial f / \partial \theta$ is shared across all
+candidate pairs, after which each pair is scored in $\mathcal{O}(1)$. We weight the win and loss
+outcomes of the candidate comparison by their posterior probabilities (computed in closed form
+from the approximation) to obtain the expected gain, and pick the pair with the largest expected
+gain.
 
-So we can pick the top 10 observations that marginally improve the loss function the most. We then compute
-what the expected improvement in the loss with a hypothetical non-infinitesimal observation and pick that.
+The same gradient can be used as a heuristic to guide a deeper tree search over sequences of
+future comparisons, and a candidate pair's predicted gain can be verified by actually refitting
+the model with the hypothetical observation added, at the cost of one extra fit per pair.
 
-In fact we can backtrack through possible observations to make using the gradient as a heuristic to search
-the tree.
+\section{Experiments}
+\label{sec:experiments}
+
+We validate the implementation on synthetic data drawn from the model.
+
+\paragraph{Posterior accuracy.}
+To check the combined effect of the mean-field factorisation and the error-function
+approximation, we compare the variational posterior to a reference obtained by random-walk
+Metropolis sampling of the \emph{exact} logistic posterior (no approximation). For $n = 12$
+items with a dense set of comparisons, Figure~\ref{fig:vbmcmc} shows that the variational
+posterior means track the MCMC means almost exactly, and that the per-item standard deviations
+agree once scores are compared on the identified (relative) scale. The one thing mean-field VB
+cannot represent is the correlation between scores --- in particular the shared, near-global shift
+that the weak hierarchical prior leaves loosely constrained --- but that shift is common to every
+item and irrelevant to the ranking, so the identified marginals VB reports match the reference.
+We do not compare the scale $\nu$ itself: at $n = 12$ it is only weakly identified, and both
+methods place broad, data-driven posteriors on it.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\textwidth]{vb_vs_mcmc.pdf}
+    \caption{Variational posterior versus a reference Metropolis sampler on the exact logistic
+    model ($n = 12$). Left: posterior means agree closely (error bars are the VB 95\% intervals).
+    Right: per-item posterior standard deviations of the centred scores --- i.e. on the identified
+    scale, with the unidentified global level removed --- agree between VB and MCMC.}
+    \label{fig:vbmcmc}
+\end{figure}
+
+\paragraph{Active selection.}
+We compare the three acquisition criteria of Section~\ref{sec:active} against choosing pairs uniformly
+at random. Each run starts with no observations and adds one comparison at a time; after every comparison
+we refit the posterior and record the number of inversions of its ranking against the ground truth. We
+use $n = 12$ items, run for $1000$ comparisons, and average over $800$ fresh random instances.
+Figure~\ref{fig:active} shows the result. Information gain and the sum of posterior variances are
+essentially indistinguishable and best, converging fastest and to the fewest inversions (final means
+$4.25$ and $4.23$, and averaged over the whole run $7.34$ and $7.41$). Uniform-random selection is a
+close but consistently worse baseline ($4.64$; $7.89$). Strikingly, greedily minimising the
+\emph{expected number of inversions} --- the very quantity being measured --- is the \emph{worst} of the
+four ($4.53$; $8.86$): as a one-step rule it is exploitative, repeatedly probing the current near-ties
+rather than spreading information, and it converges more slowly than random. The two uncertainty-directed
+criteria, which shrink posterior uncertainty broadly instead of chasing the current decision boundary,
+explore more efficiently and win. We do not claim a specific mechanism beyond this greedy myopia; a
+lookahead or tree search over the same gradient (Section~\ref{sec:active}) would likely temper it.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\textwidth]{active_selection.pdf}
+    \caption{Active pair selection ($n = 12$, averaged over $800$ fresh instances). Mean number of
+    inversions of the posterior ranking against the ground truth versus the number of comparisons
+    (logarithmic $y$-axis). Maximising information gain and minimising the sum of posterior variances are
+    indistinguishable and best; greedily minimising the expected number of inversions is the worst,
+    below even uniform-random selection.}
+    \label{fig:active}
+\end{figure}
+
+\paragraph{Performance.}
+To give a concrete sense of speed, on a single core of an AMD Ryzen~7 3700X our C++ implementation
+(compiled with \texttt{-O3}) fits a problem with $n = 80$ items in about $0.7$\,s, $n = 200$ items
+(around $1.6\times10^5$ comparisons) in about $8$\,s, and $n = 360$ items (around $5\times10^5$
+comparisons) in about $33$\,s.
+
+\paragraph{Verification.}
+We checked the closed-form gradient and Hessian --- including the correction terms of
+Section~\ref{sec:correction} --- against central differences, matching to better than $10^{-8}$, and
+likewise the active-selection tangent: the predicted marginal effect of an (infinitesimal) comparison on
+each loss matches a central-difference estimate across all pairs.
 
 
 \section*{Conclusion}
 
-This is probably more trouble than it's worth, but it's a fun exercise. The closed form formulas have no business
-working out so simple with the error function approximation, but they do. The inference is very fast which
-means this can scale to many items, or can be used for a deep backtracking search.
+Approximating the logistic link with an error function turns hierarchical Bayesian ranking into
+a problem with a fully closed-form variational objective, gradient and Hessian. The closed form
+has no business working out as cleanly as it does, but it does, and it buys two things: inference
+fast enough to scale to many items or to support deep backtracking search, and a fitted posterior
+that is differentiable in the data, which we exploit for active next-pair selection. Our
+experiments confirm that the approximation closely matches an exact-model MCMC reference.
 
-This could be extended to more sophisticated models of match outcomes, including the possibility of draws,
-the possibility of more than two players in a match, allowing scores to vary over time  and so on.
+The model could be extended to richer outcomes --- draws, more than two competitors per match,
+and scores that drift over time --- much as TrueSkill \cite{herbrich2007trueskill} handles these;
+whether the closed form survives these extensions is an open and tempting question.
 
 \printbibliography
 
