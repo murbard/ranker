@@ -67,7 +67,8 @@ def bump_eval(A, P, Q, μδ, σδ, order=2):
             Tμs += Pμs*B + Pμ*Bs + Ps*Bμ + Pk*Bμs
             Tss += Pss*B + 2*Ps*Bs + Pk*Bss
     # convert the s = σδ² derivatives to σδ:  d/dσδ = 2σδ d/ds,  d²/dσδ² = 4s d²/ds² + 2 d/ds
-    return T, Tμ, Ts*2*σδ, Tμμ, Tμs*2*σδ, 4*s*Tss + 2*Ts
+    # (the σσ conversion is gated: at order 1 it would otherwise leak 2·Ts into the "zero" slot)
+    return T, Tμ, Ts*2*σδ, Tμμ, Tμs*2*σδ, (4*s*Tss + 2*Ts) if order >= 2 else 0.0
 
 def correction(μδ, σδ, order=2):
     """Correction to  ∫ N(μδ, σδ²) log(1+e^{-z}) dz  and its derivatives, summed over the k terms.
@@ -447,7 +448,7 @@ class VBayes():
         Conversely, tie observations passed while the tie model is DISABLED would be silently
         ignored, so that direction warns."""
         if self.ties is None:
-            if tie_obs is not None and tie_obs.nnz > 0:
+            if tie_obs is not None and tie_obs.data.sum() > 0:   # not nnz: explicit zeros don't count
                 warnings.warn("tie_obs passed but the tie model is disabled (call enable_ties()); "
                               "the tie observations are being IGNORED")
             return None
@@ -629,12 +630,14 @@ class VBayes():
                 # tie model would bias active selection (the bump derivative is missing)
                 raise ValueError("observation sensitivities (dobs) are not implemented for the tie model")
             for i in range(self.n):
-                for j in range(self.n):
+                for j in range(i + 1, self.n):   # one kernel serves both directions (parity)
                     σδ = sqrt(σ[i]**2 + σ[j]**2)
                     μδ = μ[i] - μ[j]
                     _, Fμ, Fσ, _, _, _ = F_kernel(μδ, σδ, order=1)   # only first derivatives needed
                     dobs[i, j, 0] = Fσ / σδ
+                    dobs[j, i, 0] = dobs[i, j, 0]   # Fσ even in μδ
                     dobs[i, j, 1] = Fμ
+                    dobs[j, i, 1] = - 1.0 - Fμ      # Fμ(−μδ) = −1 − Fμ(μδ)
 
         pairs = self._resolve_pairs(obs, tie_obs, pairs)
         # zeros, not empty: skipped entries (diagonals) would otherwise leave uninitialized
@@ -812,18 +815,21 @@ class VBayes():
             def step(t):
                 self.newton(obs, tol=t, max_iter=max_iter, verbose=verbose, λ0=λ0, λmax=λmax,
                             tie_obs=tie_obs, pairs=pairs)
-            loose = max(tol, sqrt(tol))               # intermediate rounds need not fully converge
+            W_STAT = 1e-9                             # weight-stationarity threshold (max |Δw|)
+            loose = max(sqrt(tol), 1e-4)              # intermediate rounds need not fully converge
             for _ in range(8):
                 step(loose)
-                if self.cavi(obs, tie_obs, pairs) < 1e-9:
+                if self.cavi(obs, tie_obs, pairs) < W_STAT:
                     break
             else:
                 warnings.warn("tie-weight alternation hit its 8-round cap without stationarity")
             step(tol)                                 # always end on a full-tolerance Newton pass
-            for _ in range(2):                        # re-certify weight stationarity against the
-                if self.cavi(obs, tie_obs, pairs) < 1e-9:   # FULL-tolerance scores
+            for _ in range(4):                        # re-certify weight stationarity against the
+                if self.cavi(obs, tie_obs, pairs) < W_STAT:  # FULL-tolerance scores
                     break
                 step(tol)
+            else:
+                warnings.warn("tie weights not stationary after the re-certification rounds")
             return
         self._resolve_pairs(obs, tie_obs, None)       # warns if tie_obs is passed with ties off
         return self.newton(obs, tol=tol, max_iter=max_iter, verbose=verbose, λ0=λ0, λmax=λmax)
@@ -841,7 +847,9 @@ class VBayes():
             # don't stop if we're still dampening the hessian, but do stop if it's gone too far
             if (last_val and abs(last_val - gh.val)/abs(gh.val) < tol and λ == λ0) or λ > λmax:
                 break
-            if np.linalg.norm(gh.g) < tol:   # already at the optimum (matches the C++ newton)
+            # already at the optimum? test the LOG-domain gradient (σ/α/β tails scaled by the
+            # parameter, as the C++ newton's natively log-domain gradient is)
+            if sqrt(np.sum(gh.g[:self.n]**2) + np.sum((gh.g[self.n:] * self.params[self.n:])**2)) < tol:
                 break
             last_val = gh.val
             λ = λ0

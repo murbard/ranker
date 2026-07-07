@@ -82,7 +82,9 @@ inline void bump_eval(int K, const double* A, const double* P_, const double* Q_
             Tss += Pss*B + 2*Ps*Bs + P*Bss;
         }
     }
-    tμ = Tμ; tσ = Ts*2*σδ; tμμ = Tμμ; tμσ = Tμs*2*σδ; tσσ = 4*s*Tss + 2*Ts;
+    tμ = Tμ; tσ = Ts*2*σδ; tμμ = Tμμ; tμσ = Tμs*2*σδ;
+    // the σσ conversion is gated: at order 1 it would otherwise leak 2·Ts into the "zero" slot
+    tσσ = order >= 2 ? 4*s*Tss + 2*Ts : 0.0;
 }
 
 // Correction to  ∫ N(μδ, σδ²) log(1+e^{-z}) dz  and its derivatives wrt (μδ, σδ), summed over terms.
@@ -127,21 +129,9 @@ inline void basis_phi(int K, const double* A, double μδ, double σδ2, double*
     }
 }
 
-// Gradient kernel at BOTH ±μδ from a single evaluation, exploiting parity: erf and the
-// correction's Tμ are odd in μδ, the Gaussian factor and Fσ are even.  Used by the acquisition
-// loop, which needs the win (μδ) and lose (−μδ) first derivatives for every candidate pair.
-inline void F_kernel_pair(double μδ, double σδ, double& Fμw, double& Fμl, double& Fσ) {
-    const double h = sqrt(16.0 / M_PI + 2 * σδ * σδ);
-    const double sqrt_π_h = sqrt(M_PI) * h;
-    const double μδ_over_h = μδ / h;
-    const double e = exp(-μδ_over_h * μδ_over_h);
-    const double er = erf(μδ_over_h);
-    double Tc, tμ, tσ, tμμ, tμσ, tσσ;
-    correction(μδ, σδ, 1, Tc, tμ, tσ, tμμ, tμσ, tσσ);
-    Fμw = - 0.5 * (1 - er) + tμ;
-    Fμl = - 0.5 * (1 + er) - tμ;
-    Fσ  = e * σδ / sqrt_π_h + tσ;
-}
+// Parity note for the acquisition paths: since erf and the correction's Tμ are odd in μδ while
+// Fσ is even, one F_kernel evaluation yields both directions of a pair:
+//     Fμ(−μδ) = −1 − Fμ(μδ)      and      Fσ(−μδ) = Fσ(μδ).
 
 // boost variate generator
 typedef boost::mt19937 RNGType;
@@ -801,21 +791,25 @@ class Ranker {
 
         void fit(const Observations& obs, const double tol = 1e-8, const int max_iter = 1e6, const bool verbose = false) {
             if (!ties) { newton(obs, tol, max_iter, verbose); return; }
-            const double loose = std::max(tol, sqrt(tol)); // intermediate rounds need not fully converge
+            const double W_STAT = 1e-9;                    // weight-stationarity threshold (max |Δw|)
+            const double loose = std::max(sqrt(tol), 1e-4); // intermediate rounds need not fully converge
             double dw = 1.0;
-            for (int r = 0; r < 8 && dw >= 1e-9; r++) {   // alternate Newton and the exact w-update
+            for (int r = 0; r < 8 && dw >= W_STAT; r++) {  // alternate Newton and the exact w-update
                 newton(obs, loose, max_iter, verbose);
                 dw = cavi(obs);
             }
-            if (dw >= 1e-9)
+            if (dw >= W_STAT)
                 std::cerr << "warning: tie-weight alternation hit its 8-round cap without stationarity\n";
             // always end on a full-tolerance Newton pass, so the returned parameters (and cached
             // val/gradient/hessian) correspond to the stored weights ...
             newton(obs, tol, max_iter, verbose);
-            for (int r = 0; r < 2; r++) {                 // ... and re-certify weight stationarity
-                if (cavi(obs) < 1e-9) break;              //     against the FULL-tolerance scores
-                newton(obs, tol, max_iter, verbose);
+            bool certified = false;
+            for (int r = 0; r < 4 && !certified; r++) {    // ... and re-certify weight stationarity
+                certified = cavi(obs) < W_STAT;            //     against the FULL-tolerance scores
+                if (!certified) newton(obs, tol, max_iter, verbose);
             }
+            if (!certified)
+                std::cerr << "warning: tie weights not stationary after the re-certification rounds\n";
         }
 };
 
@@ -879,13 +873,13 @@ static double eig_pair(double md, double sd) {
 // dobs (dense, n*n*2) from mu,sigma
 static void compute_dobs(const std::vector<double>& mu, const std::vector<double>& sg, int n, std::vector<double>& d0, std::vector<double>& d1) {
     d0.assign(n * n, 0); d1.assign(n * n, 0);
-    for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) {
+    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {   // one kernel serves both directions
         double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
         double md = mu[i] - mu[j];
         double F, Fμ, Fσ, Fμμ, Fμσ, Fσσ;
         F_kernel(md, sd, 1, F, Fμ, Fσ, Fμμ, Fμσ, Fσσ);
-        d0[i * n + j] = Fσ / sd;
-        d1[i * n + j] = Fμ;
+        d0[i * n + j] = Fσ / sd;   d0[j * n + i] = d0[i * n + j];   // Fσ even in μδ
+        d1[i * n + j] = Fμ;        d1[j * n + i] = -1.0 - Fμ;       // Fμ(−μδ) = −1 − Fμ(μδ)
     }
 }
 
@@ -1078,11 +1072,11 @@ static std::pair<int,int> select_logdomain(Ranker& rk, const Observations& obs, 
     for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
         double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
         double md = mu[i] - mu[j];
-        double Fμw, Fμl, Fσ;
-        F_kernel_pair(md, sd, Fμw, Fμl, Fσ);   // one kernel gives both ±md gradients (parity)
-        double gmd  = Fμw;    // win: i beats j
-        double gmd2 = Fμl;    // lose: j beats i
-        double gsd  = -Fσ;    // Fσ even in md
+        double F, Fμ, Fσ, u3, u4, u5;
+        F_kernel(md, sd, 1, F, Fμ, Fσ, u3, u4, u5);
+        double gmd  = Fμ;           // win: i beats j
+        double gmd2 = -1.0 - Fμ;    // lose: j beats i  (parity: Fμ(−μδ) = −1 − Fμ(μδ))
+        double gsd  = -Fσ;          // Fσ even in md
         double sig_part = -(gsd / sd) * (factor(n + i) * sg[i] * sg[i] + factor(n + j) * sg[j] * sg[j]);
         double ifwin  = (factor(i) - factor(j)) * gmd  + sig_part;
         double iflose = (factor(j) - factor(i)) * gmd2 + sig_part;
@@ -1203,25 +1197,18 @@ static int verify3(const std::string& atomfile) {
             for (auto& x : rk.ties->w) x /= Z;
             rk.ties->premix();
         }
-        rk.evaluate(obs, true, false);
+        rk.evaluate(obs, true, true);
         double v0 = *rk.val;
         ublas::vector<double> g0 = *rk.gradient;
-        double h = 1e-6, maxerr = 0;
+        auto Hd = rk.hessian->toDense();
+        // gradient and Hessian against central differences, from one set of perturbed evaluations
+        double h = 1e-6, maxerr = 0, hmaxerr = 0;
         Ranker rp(n, p), rm(n, p);                 // constructed once; only params(k) varies
         rp.ties = rk.ties; rm.ties = rk.ties;
         for (int k = 0; k < 2 * n + 2; k++) {
             rp.params(k) = p(k) + h; rm.params(k) = p(k) - h;
-            rp.evaluate(obs); rm.evaluate(obs);
-            maxerr = std::max(maxerr, std::fabs((*rp.val - *rm.val) / (2 * h) - g0(k)));
-            rp.params(k) = p(k); rm.params(k) = p(k);
-        }
-        // Hessian against central differences of the gradient
-        rk.evaluate(obs, true, true);
-        auto Hd = rk.hessian->toDense();
-        double hmaxerr = 0;
-        for (int k = 0; k < 2 * n + 2; k++) {
-            rp.params(k) = p(k) + h; rm.params(k) = p(k) - h;
             rp.evaluate(obs, true, false); rm.evaluate(obs, true, false);
+            maxerr = std::max(maxerr, std::fabs((*rp.val - *rm.val) / (2 * h) - g0(k)));
             for (int l = 0; l < 2 * n + 2; l++)
                 hmaxerr = std::max(hmaxerr, std::fabs(((*rp.gradient)(l) - (*rm.gradient)(l)) / (2 * h) - Hd(l, k)));
             rp.params(k) = p(k); rm.params(k) = p(k);
@@ -1317,7 +1304,13 @@ int main(int argc, char ** argv) {
         int count = argc > 3 ? atoi(argv[3]) : 160000;
         Instance inst = Instance::random(nb);
         Observations obs(nb, inst, count);
-        Ranker ranker(nb, init_params(nb));   // same cold start as verify2/tiebench/run_once
+        // NB: bench deliberately keeps its historical cold start (mu=0, sigma=1, prior alpha/beta)
+        // rather than init_params(): the paper's quoted timings were measured with this start, and
+        // changing it alters the iteration count (~15%), silently invalidating those numbers.
+        ublas::vector<double> params(2 * nb + 2);
+        for (int i = 0; i < nb; i++) { params(i) = 0.0; params(nb + i) = 0.0; }
+        params(2 * nb) = log(Mα); params(2 * nb + 1) = log(Mβ);
+        Ranker ranker(nb, params);
         auto t0 = std::chrono::high_resolution_clock::now();
         ranker.fit(obs, 1e-8, 1e6, false);
         auto t1 = std::chrono::high_resolution_clock::now();
