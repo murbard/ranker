@@ -24,6 +24,8 @@
 
 
 #include <cstdlib>
+#include <fstream>
+#include <chrono>
 
 // boost optional
 #include <boost/optional.hpp>
@@ -44,29 +46,31 @@ const int CORR_K = 5;
 const double CORR_A[CORR_K] = {0.04802229968, 0.08966847198, 0.1575268951, 0.252698338, 0.4630803829};
 const double CORR_C[CORR_K] = {0.0007259888421, 0.00854921256, 0.02779792245, 0.017919263, 0.001535080506};
 
-// Correction to  ∫ N(μδ, σδ²) log(1+e^{-z}) dz  and its derivatives wrt (μδ, σδ), summed over terms.
-// Same (μδ, σδ) convention as the erf kernels gμδ/gσδ/hμμδ/hμσδ/hσσδ, so they simply add.
-// order==0 fills only T.
-inline void correction(double μδ, double σδ, int order,
-                       double& T, double& tμ, double& tσ, double& tμμ, double& tμσ, double& tσσ) {
+// Generalized bump integral:  ∫ N(μδ, σδ²) Σ_k (p_k + q_k a_k z²) e^{-a_k z²} dz  and its plain
+// derivatives wrt (μδ, σδ).  Used for the erf-approximation correction (p=q=c) and for the tie
+// model's premixed atom bumps.  order==0 fills only T.
+inline void bump_eval(int K, const double* A, const double* P_, const double* Q_,
+                      double μδ, double σδ, int order,
+                      double& T, double& tμ, double& tσ, double& tμμ, double& tμσ, double& tσσ) {
     double s = σδ*σδ, μ = μδ;
     T = tμ = tσ = tμμ = tμσ = tσσ = 0.0;
     if (order == 0) {
-        for (int k = 0; k < CORR_K; k++) {
-            double a = CORR_A[k], c = CORR_C[k], D = 1 + 2*a*s;
-            T += c*exp(-a*μ*μ/D)/sqrt(D)*(1 + a*μ*μ/(D*D) + a*s/D);
+        for (int k = 0; k < K; k++) {
+            double a = A[k], D = 1 + 2*a*s;
+            T += exp(-a*μ*μ/D)/sqrt(D)*(P_[k] + Q_[k]*(a*μ*μ/(D*D) + a*s/D));
         }
         return;
     }
     double Tμ = 0, Ts = 0, Tμμ = 0, Tμs = 0, Tss = 0;   // derivatives wrt μ and s = σδ²
-    for (int k = 0; k < CORR_K; k++) {
-        double a = CORR_A[k], c = CORR_C[k];
-        double D = 1 + 2*a*s, E = exp(-a*μ*μ/D), P = c*E/sqrt(D), B = 1 + a*μ*μ/(D*D) + a*s/D;
+    for (int k = 0; k < K; k++) {
+        double a = A[k], p = P_[k], q = Q_[k];
+        double D = 1 + 2*a*s, E = exp(-a*μ*μ/D), P = E/sqrt(D);
+        double B = p + q*(a*μ*μ/(D*D) + a*s/D);
         double Pμ = P*(-2*a*μ/D), R = -a/D + 2*a*a*μ*μ/(D*D), Ps = P*R;
         double Pμμ = P*(4*a*a*μ*μ/(D*D) - 2*a/D), Rs = 2*a*a/(D*D) - 8*a*a*a*μ*μ/(D*D*D), Pss = P*(R*R + Rs);
         double Pμs = Ps*(-2*a*μ/D) + P*4*a*a*μ/(D*D);
-        double Bμ = 2*a*μ/(D*D), Bs = a/(D*D) - 4*a*a*μ*μ/(D*D*D), Bμμ = 2*a/(D*D);
-        double Bμs = -8*a*a*μ/(D*D*D), Bss = -4*a*a/(D*D*D) + 24*a*a*a*μ*μ/(D*D*D*D);
+        double Bμ = q*2*a*μ/(D*D), Bs = q*(a/(D*D) - 4*a*a*μ*μ/(D*D*D)), Bμμ = q*2*a/(D*D);
+        double Bμs = q*(-8*a*a*μ/(D*D*D)), Bss = q*(-4*a*a/(D*D*D) + 24*a*a*a*μ*μ/(D*D*D*D));
         T   += P*B;
         Tμ  += Pμ*B + P*Bμ;
         Ts  += Ps*B + P*Bs;
@@ -75,6 +79,23 @@ inline void correction(double μδ, double σδ, int order,
         Tss += Pss*B + 2*Ps*Bs + P*Bss;
     }
     tμ = Tμ; tσ = Ts*2*σδ; tμμ = Tμμ; tμσ = Tμs*2*σδ; tσσ = 4*s*Tss + 2*Ts;
+}
+
+// Correction to  ∫ N(μδ, σδ²) log(1+e^{-z}) dz  and its derivatives wrt (μδ, σδ), summed over terms.
+// Same (μδ, σδ) convention as the erf kernels gμδ/gσδ/hμμδ/hμσδ/hσσδ, so they simply add.
+inline void correction(double μδ, double σδ, int order,
+                       double& T, double& tμ, double& tσ, double& tμμ, double& tμσ, double& tσσ) {
+    bump_eval(CORR_K, CORR_A, CORR_C, CORR_C, μδ, σδ, order, T, tμ, tσ, tμμ, tμσ, tσσ);
+}
+
+// order-0 per-basis-term integrals (for the tie model's CAVI accumulators)
+inline void basis_phi(int K, const double* A, double μδ, double σδ, double* φp, double* φq) {
+    double s = σδ*σδ, μ = μδ;
+    for (int k = 0; k < K; k++) {
+        double a = A[k], D = 1 + 2*a*s, E = exp(-a*μ*μ/D)/sqrt(D);
+        φp[k] = E;
+        φq[k] = E*(a*μ*μ/(D*D) + a*s/D);
+    }
 }
 
 // boost variate generator
@@ -124,13 +145,15 @@ class Instance {
 
 class Observations {
     public:
-        // mapped matrix X
+        // mapped matrix X: directed win counts.  T: tie counts, stored at (min,max), used only
+        // when the model has tie support enabled (empty otherwise -- zero overhead).
         mapped_matrix<int> X;
+        mapped_matrix<int> T;
         // optional coordinate matrix that matches X
         optional<coordinate_matrix<int> > Xcoord;
 
-        Observations(int n) : X(n, n) {}
-        Observations(int n, const Instance& instance, int count) : X(n,n) {
+        Observations(int n) : X(n, n), T(n, n) {}
+        Observations(int n, const Instance& instance, int count) : X(n,n), T(n,n) {
             X.reserve(count);
             // draw from the binomial distribution with count = count and
             // n(n-1)/2 buckets
@@ -150,21 +173,82 @@ class Observations {
                 }
             }
         }
+        // Davidson generator: win/tie/loss with true tie parameter λ
+        Observations(int n, const Instance& instance, int count, double λ) : X(n,n), T(n,n) {
+            X.reserve(count);
+            for(int c = 0 ; c < count ; c++) {
+                int i = rand() % n;
+                int j = rand() % n;
+                while (i == j) { j = rand() % n; }
+                double d = instance.z(i) - instance.z(j);
+                double Z = 2*cosh(d/2) + λ;
+                double r = (double)rand() / (double)RAND_MAX * Z;
+                if (r < exp(d/2)) X(i,j) += 1;
+                else if (r < exp(d/2) + λ) T(std::min(i,j), std::max(i,j)) += 1;
+                else X(j,i) += 1;
+            }
+        }
         ~Observations() {}
-        Observations(const Observations& other) : X(other.X) {}
-        Observations(Observations&& other) : X(std::move(other.X)) {}
+        Observations(const Observations& other) : X(other.X), T(other.T) {}
+        Observations(Observations&& other) : X(std::move(other.X)), T(std::move(other.T)) {}
         Observations& operator=(const Observations& other) {
             X = other.X;
+            T = other.T;
             return *this;
         }
         Observations& operator=(Observations&& other) {
             X = std::move(other.X);
+            T = std::move(other.T);
             return *this;
         }
 
         void computeCoordinateMatrix() {
             Xcoord = optional<coordinate_matrix<int>>(X);
         }
+};
+
+// --- tie model: Davidson tie parameter λ with a categorical variational posterior over J atoms ---
+// Atoms sit at prior quantiles of p0 = λ/(2+λ) (see python/fit_tie_atoms.py), each with prior
+// mass 1/J.  Every atom's bump  b_λ(δ) = log(1 + λ/(2cosh(δ/2)))  is represented in a shared
+// basis {e^{-a_l δ²}, a_l δ² e^{-a_l δ²}}, so the w-mixture premixes into ONE bump_eval call per
+// pair: the per-pair cost is independent of J.
+struct TieModel {
+    int J = 0, L = 0;
+    std::vector<double> a;                    // L shared widths
+    std::vector<double> λ, logλ, π;           // J atoms: location, log, prior mass
+    std::vector<double> P, Q;                 // (J × L) coefficients, atom j at [j*L, j*L+L)
+    std::vector<double> w;                    // categorical posterior weights
+    std::vector<double> p̄, q̄;                 // premixed coefficients Σ_j w_j (P_j, Q_j)
+    double wlogλ = 0;                         // Σ_j w_j log λ_j
+
+    static TieModel load(const std::string& path) {
+        TieModel t; std::ifstream f(path);
+        if (!f) throw std::runtime_error("cannot open tie atom file " + path);
+        f >> t.J >> t.L;
+        t.a.resize(t.L);
+        for (auto& v : t.a) f >> v;
+        t.λ.resize(t.J); t.logλ.resize(t.J); t.π.resize(t.J);
+        t.P.resize((size_t)t.J*t.L); t.Q.resize((size_t)t.J*t.L);
+        for (int j = 0; j < t.J; j++) {
+            f >> t.λ[j] >> t.π[j];
+            t.logλ[j] = log(t.λ[j]);
+            for (int l = 0; l < t.L; l++) f >> t.P[(size_t)j*t.L+l] >> t.Q[(size_t)j*t.L+l];
+        }
+        if (!f) throw std::runtime_error("bad tie atom file " + path);
+        t.w.assign(t.J, 1.0/t.J);
+        t.p̄.resize(t.L); t.q̄.resize(t.L);
+        t.premix();
+        return t;
+    }
+    void premix() {
+        wlogλ = 0;
+        for (int j = 0; j < J; j++) wlogλ += w[j]*logλ[j];
+        for (int l = 0; l < L; l++) {
+            double sp = 0, sq = 0;
+            for (int j = 0; j < J; j++) { sp += w[j]*P[(size_t)j*L+l]; sq += w[j]*Q[(size_t)j*L+l]; }
+            p̄[l] = sp; q̄[l] = sq;
+        }
+    }
 };
 
 
@@ -289,16 +373,18 @@ class Ranker {
     public:
         int n;
         vector<double> params;
+        optional<TieModel> ties;   // engaged => Davidson tie model; empty => plain Bradley-Terry
 
         Ranker(int n) : n(n), params(2 * n + 2), hessian(), gradient(), val() {}
         Ranker(int n, const vector<double> &params) : n(n), params(params), hessian(), gradient(), val() {}
 
         ~Ranker() {}
-        Ranker(const Ranker& other) : n(other.n), params(other.params), hessian(other.hessian), gradient(other.gradient) {}
-        Ranker(Ranker&& other) : n(std::move(other.n)), params(std::move(other.params)), hessian(std::move(other.hessian)), gradient(std::move(other.gradient)) {}
+        Ranker(const Ranker& other) : n(other.n), params(other.params), ties(other.ties), hessian(other.hessian), gradient(other.gradient) {}
+        Ranker(Ranker&& other) : n(std::move(other.n)), params(std::move(other.params)), ties(std::move(other.ties)), hessian(std::move(other.hessian)), gradient(std::move(other.gradient)) {}
         Ranker& operator=(const Ranker& other) {
             n = other.n;
             params = other.params;
+            ties = other.ties;
             hessian = other.hessian;
             gradient = other.gradient;
             return *this;
@@ -306,9 +392,30 @@ class Ranker {
         Ranker& operator=(Ranker&& other) {
             n = std::move(other.n);
             params = std::move(other.params);
+            ties = std::move(other.ties);
             hessian = std::move(other.hessian);
             gradient = std::move(other.gradient);
             return *this;
+        }
+
+        // visit each observed unordered pair (a<b) once with counts (n_w, n_l, n_t);
+        // tie counts participate only when the tie model is enabled
+        template<class F>
+        void each_pair(const Observations& obs, F f) const {
+            const bool tie_on = bool(ties);
+            for (auto it = obs.X.begin1(); it != obs.X.end1(); ++it)
+                for (auto el = it.begin(); el != it.end(); ++el) {
+                    const int i = el.index1(), j = el.index2();
+                    if (i == j) continue;
+                    if (i < j) f(i, j, *el, obs.X(j, i), tie_on ? obs.T(i, j) : 0);
+                    else if (!obs.X.find_element(j, i)) f(j, i, 0, *el, tie_on ? obs.T(j, i) : 0);
+                }
+            if (tie_on)
+                for (auto it = obs.T.begin1(); it != obs.T.end1(); ++it)
+                    for (auto el = it.begin(); el != it.end(); ++el) {
+                        const int a = el.index1(), b = el.index2();
+                        if (!obs.X.find_element(a, b) && !obs.X.find_element(b, a)) f(a, b, 0, 0, *el);
+                    }
         }
         std::string print_gradient() {
             std::stringstream ss;
@@ -456,19 +563,17 @@ class Ranker {
                 hessian->μσαβ *= αβ;
             }
 
-            // Now we add observations
-            // We loop over all non zero elements of the sparse observation matrix, obs.X
+            // Now we add observations, visiting each unordered pair (i<j) once.  Davidson form:
+            // with counts (n_w, n_l, n_t) and count = n_w+n_l+n_t,
+            //   v += count (F(μδ,σδ) + E[b_λ](μδ,σδ)) + (2 n_l + n_t) μδ/2 − n_t Σ_j w_j log λ_j,
+            // where E[b_λ] is the premixed tie bump (absent without tie support).  For n_t = 0 this
+            // equals the Bradley-Terry  n_w F(μδ) + n_l F(−μδ)  exactly, since F(−μ) = μ + F(μ).
+            const bool tie_on = bool(ties);
+            coordinate_matrix<double> hobs(2 * n, 2 * n, (obs.X.nnz() + obs.T.nnz()) * 6);
 
-            coordinate_matrix<double> hobs(2 * n, 2 * n, obs.X.nnz() * 6);
-
-            for(auto it = obs.X.begin1() ; it != obs.X.end1(); ++it) {
-                for(auto el = it.begin(); el != it.end(); ++el) {
-                    const int i = el.index1();
-                    const int j = el.index2();
-                    if (i == j) {
-                        continue; // this should not happen
-                    }
-                    const int count = *el;
+            each_pair(obs, [&](int i, int j, int n_w, int n_l, int n_t) {
+                    const int count = n_w + n_l + n_t;
+                    if (count == 0) return;
 
                     const double σδ = sqrt(σ2(i) + σ2(j));
                     const double h = sqrt(16.0 / M_PI + 2 * σδ * σδ);
@@ -478,18 +583,25 @@ class Ranker {
                     const double exp_minus_μδ_over_h_square = exp(-μδ_over_h * μδ_over_h);
                     double Tc, tμ, tσ, tμμ, tμσ, tσσ;
                     correction(μδ, σδ, compute_gradient ? 2 : 0, Tc, tμ, tσ, tμμ, tμσ, tσσ);
+                    if (tie_on) {   // premixed atom bumps enter exactly like the correction terms
+                        double Bt, bμ, bσ, bμμ, bμσ, bσσ;
+                        bump_eval(ties->L, ties->a.data(), ties->p̄.data(), ties->q̄.data(), μδ, σδ,
+                                  compute_gradient ? 2 : 0, Bt, bμ, bσ, bμμ, bμσ, bσσ);
+                        Tc += Bt; tμ += bμ; tσ += bσ; tμμ += bμμ; tμσ += bμσ; tσσ += bσσ;
+                    }
                     const double gμδ = - 0.5 * (1 - erf(μδ_over_h)) + tμ;   // gμδ stores +dF/dμδ
                     const double gσδ = - exp_minus_μδ_over_h_square * σδ / sqrt_π_h - tσ;  // gσδ stores -dF/dσδ
+                    const double lin = 0.5 * (2.0 * n_l + n_t);             // linear-in-μδ coefficient
 
                     // F_erf + correction; write F_erf explicitly rather than reuse the augmented gμδ
                     v += count * (exp_minus_μδ_over_h_square * h / (2 * sqrt(M_PI))
-                                  - 0.5 * μδ * (1 - erf(μδ_over_h)) + Tc);
+                                  - 0.5 * μδ * (1 - erf(μδ_over_h)) + Tc)
+                         + lin * μδ - (tie_on ? n_t * ties->wlogλ : 0.0);
 
                     if (compute_gradient) {
-                        // Compute gradient
                         // dv/dμi, dv/dμj
-                        (*g_μ)(i) += count * gμδ;
-                        (*g_μ)(j) -= count * gμδ;
+                        (*g_μ)(i) += count * gμδ + lin;
+                        (*g_μ)(j) -= count * gμδ + lin;
 
                         // dv/dlnσi, dv/dlnσj
                         (*g_σ)(i) -= count * (gσδ * σ2(i) / σδ);
@@ -500,7 +612,7 @@ class Ranker {
 
                         //    hμμδ = - exp(-(μδ/h)**2) / (sqrt(π) * h)
                         //    hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3)
-                        //    hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + μδ**2)) / (π**(5/2) * h**5)
+                        //    hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + π * μδ**2)) / (π**(5/2) * h**5)
 
                         const double hμμδ = - exp_minus_μδ_over_h_square / sqrt_π_h - tμμ;
                         const double hμσδ = 2 * μδ * σδ * exp_minus_μδ_over_h_square / (sqrt(M_PI) * h * h * h) - tμσ;
@@ -513,12 +625,9 @@ class Ranker {
                         hessian->diag(n+i) -= count * σ2(i) / σδ * (gσδ * σ2(j) / (σδ * σδ) + hσσδ * σ2(i) / σδ + gσδ);
                         hessian->diag(n+j) -= count * σ2(j) / σδ * (gσδ * σ2(i) / (σδ * σδ) + hσσδ * σ2(j) / σδ + gσδ);
 
-                        int row = std::min(i, j);
-                        int col = std::max(i, j);
-
-                        // hμiμj, hσiσj
-                        hobs.append_element(row, col, count * hμμδ);
-                        hobs.append_element(n + row, n + col, - count * (σ2(i) * σ2(j) / (σδ * σδ) * (hσσδ - gσδ / σδ)));
+                        // hμiμj, hσiσj   (i < j always here)
+                        hobs.append_element(i, j, count * hμμδ);
+                        hobs.append_element(n + i, n + j, - count * (σ2(i) * σ2(j) / (σδ * σδ) * (hσσδ - gσδ / σδ)));
 
                         // hμiσi, hμjσi
                         double chσ = count * hμσδ * σ2(i) / σδ;
@@ -530,8 +639,7 @@ class Ranker {
                         hobs.append_element(i, n + j, - chσ);
                         hobs.append_element(j, n + j, chσ);
                     }
-                }
-            }
+            });
             if (compute_hessian)
                 hessian->obs = std::move(hobs);   // once, after all observation rows
 
@@ -541,7 +649,7 @@ class Ranker {
                 *val = v;
         }
 
-        void fit(const Observations& obs, const double tol = 1e-8, const int max_iter = 1e6, const bool verbose = false) {
+        void newton(const Observations& obs, const double tol = 1e-8, const int max_iter = 1e6, const bool verbose = false) {
             int k = 0;
             double last_val = 0; bool have_last = false;
             while (k < max_iter) {
@@ -567,9 +675,9 @@ class Ranker {
                 do {
                     // cg (hessian, gradient, dx,  1e-10, tol, 1000 * n );
                     // use the ublas cg solver with diagonal preconditioner
-                    vector<double> save_params(2 * n + 2);
                     auto dx = std::move(hessian->cg(*gradient, λ, tol, 1000 * n));
                     other = std::move(Ranker(n, params - dx));
+                    other.ties = ties;              // the trial point keeps the tie model
                     other.evaluate(obs);
                     if ((*other.val) < (*val)) {
                         break;
@@ -582,6 +690,52 @@ class Ranker {
                 *this = std::move(other);
                 if (verbose) std::cout << "iter: " << k << ", val:" << *val << ", λ: " << λ << std::endl;
                 k++;
+            }
+        }
+
+        // Exact CAVI coordinate update of the tie weights:  w_j ∝ π_j exp(v_j), where
+        // v_j = (Σ n_t) log λ_j − Σ_pairs count · E[b_{λ_j}]  (the data term is linear in w).
+        // The per-pair basis integrals are accumulated once (L values); v_j is then an L-dot per
+        // atom, so the pass is J-free over pairs.  Returns max |Δw_j|.
+        double cavi(const Observations& obs) {
+            if (!ties) return 0.0;
+            TieModel& t = *ties;
+            const int J = t.J, L = t.L;
+            std::vector<double> accp(L, 0.0), accq(L, 0.0), φp(L), φq(L);
+            double nt_tot = 0;
+            each_pair(obs, [&](int a, int b, int n_w, int n_l, int n_t) {
+                const int count = n_w + n_l + n_t;
+                if (count == 0) return;
+                nt_tot += n_t;
+                const double σδ = sqrt(exp(2*params(n+a)) + exp(2*params(n+b)));
+                const double μδ = params(a) - params(b);
+                basis_phi(L, t.a.data(), μδ, σδ, φp.data(), φq.data());
+                for (int l = 0; l < L; l++) { accp[l] += count*φp[l]; accq[l] += count*φq[l]; }
+            });
+            std::vector<double> vj(J);
+            double mx = -1e300;
+            for (int j = 0; j < J; j++) {
+                double s = 0;
+                for (int l = 0; l < L; l++) s += t.P[(size_t)j*L+l]*accp[l] + t.Q[(size_t)j*L+l]*accq[l];
+                vj[j] = nt_tot*t.logλ[j] - s + log(t.π[j]);
+                mx = std::max(mx, vj[j]);
+            }
+            double Z = 0, dw = 0;
+            for (int j = 0; j < J; j++) { vj[j] = exp(vj[j] - mx); Z += vj[j]; }
+            for (int j = 0; j < J; j++) {
+                double nw = vj[j]/Z;
+                dw = std::max(dw, std::fabs(nw - t.w[j]));
+                t.w[j] = nw;
+            }
+            t.premix();
+            return dw;
+        }
+
+        void fit(const Observations& obs, const double tol = 1e-8, const int max_iter = 1e6, const bool verbose = false) {
+            if (!ties) { newton(obs, tol, max_iter, verbose); return; }
+            for (int r = 0; r < 8; r++) {          // alternate Newton and the exact w-update
+                newton(obs, tol, max_iter, verbose);
+                if (cavi(obs) < 1e-9) break;
             }
         }
 };
@@ -772,6 +926,59 @@ static std::pair<int,int> select_eig(const std::vector<double>& mu, const std::v
     return bp;
 }
 
+// ---- 3-outcome EIG for the tie model ----
+// The λ-mixed outcome probabilities and conditional entropy depend on δ only, so they are
+// tabulated once per selection (cost ∝ J, shared across all candidate pairs); each candidate
+// then costs 21 interpolated Gauss-Hermite nodes, independent of J.
+static inline double xlogx(double p) { return p > 1e-300 ? p*log(p) : 0.0; }
+static inline double H3(double pw, double pt) {
+    double pl = 1.0 - pw - pt;
+    return -(xlogx(pw) + xlogx(pt) + xlogx(pl));
+}
+struct TieEigTable {
+    static const int NPTS = 2501;
+    static constexpr double LO = -25.0, STEP = 0.02;
+    std::vector<double> Pw, Pt, Hc;
+    void build(const TieModel& t) {
+        Pw.assign(NPTS, 0); Pt.assign(NPTS, 0); Hc.assign(NPTS, 0);
+        for (int k = 0; k < NPTS; k++) {
+            double d = LO + STEP*k, A = 2*cosh(d/2), e = exp(d/2);
+            double pw = 0, pt = 0, hc = 0;
+            for (int j = 0; j < t.J; j++) {
+                double Z = A + t.λ[j], pwj = e/Z, ptj = t.λ[j]/Z;
+                pw += t.w[j]*pwj; pt += t.w[j]*ptj; hc += t.w[j]*H3(pwj, ptj);
+            }
+            Pw[k] = pw; Pt[k] = pt; Hc[k] = hc;
+        }
+    }
+    inline void interp(double d, double& pw, double& pt, double& hc) const {
+        double x = (d - LO)/STEP;
+        if (x <= 0) { pw = Pw[0]; pt = Pt[0]; hc = Hc[0]; return; }
+        if (x >= NPTS-1) { pw = Pw[NPTS-1]; pt = Pt[NPTS-1]; hc = Hc[NPTS-1]; return; }
+        int k = (int)x; double f = x - k;
+        pw = Pw[k]*(1-f) + Pw[k+1]*f; pt = Pt[k]*(1-f) + Pt[k+1]*f; hc = Hc[k]*(1-f) + Hc[k+1]*f;
+    }
+};
+static double eig3_pair(double md, double sd, const TieEigTable& tab) {
+    double pw = 0, pt = 0, hc = 0, a, b, c;
+    for (int k = 0; k < 21; k++) {
+        tab.interp(md + sd*GHx[k], a, b, c);
+        pw += GHw[k]*a; pt += GHw[k]*b; hc += GHw[k]*c;
+    }
+    return H3(pw, pt) - hc;
+}
+static std::pair<int,int> select_eig_ties(const std::vector<double>& mu, const std::vector<double>& sg,
+                                          int n, const TieModel& t) {
+    TieEigTable tab; tab.build(t);
+    double best = -1e300; std::pair<int,int> bp(0, 1);
+    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
+        double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
+        double e = eig3_pair(mu[i] - mu[j], sd, tab);
+        if (e > best) { best = e; bp = {i, j}; }
+    }
+    return bp;
+}
+
 // ---- LOG-domain native acquisition: reuses the fit's log-domain Hessian (rk.hessian) + cg ----
 // gain df/do is coordinate-invariant, so this yields the same selected pair & gain as Python's linear domain.
 // Requires rk to be at a fitted optimum (so H_log == S H_lin S on the invariants).
@@ -888,6 +1095,81 @@ static int verify() {
     return 0;
 }
 
+// ----- verify3: tie-model checks -- FD gradients (with and without ties), fit, reference values -----
+static const char* TIE_ATOMS_DEFAULT = "fit_results/tie_atoms_J16.txt";
+static int verify3(const std::string& atomfile) {
+    int n = 6;
+    Observations obs(n);
+    int O[9][3] = {{0,1,3},{1,0,1},{2,3,2},{0,4,2},{4,5,1},{5,2,2},{3,1,1},{2,5,2},{4,0,1}};
+    for (auto& o : O) obs.X(o[0], o[1]) = o[2];
+    int TT[4][3] = {{0,1,2},{2,3,1},{1,4,2},{3,5,1}};
+    for (auto& t : TT) obs.T(t[0], t[1]) = t[2];
+
+    ublas::vector<double> p(2 * n + 2);
+    double mu0[6] = {0.30, -0.50, 0.10, 0.80, -0.20, 0.40};
+    double sg0[6] = {0.50, 0.70, 0.45, 0.90, 0.60, 0.55};
+    for (int i = 0; i < n; i++) { p(i) = mu0[i]; p(n + i) = log(sg0[i]); }
+    p(2 * n) = log(1.5); p(2 * n + 1) = log(2.5);
+
+    std::cout.precision(8); std::cout << std::fixed;
+    for (int tie_on = 0; tie_on <= 1; tie_on++) {
+        Ranker rk(n, p);
+        if (tie_on) {
+            rk.ties = TieModel::load(atomfile);
+            for (int j = 0; j < rk.ties->J; j++) rk.ties->w[j] = (1.0 + j % 3);  // non-uniform w
+            double Z = 0; for (double x : rk.ties->w) Z += x;
+            for (auto& x : rk.ties->w) x /= Z;
+            rk.ties->premix();
+        }
+        rk.evaluate(obs, true, false);
+        double v0 = *rk.val;
+        ublas::vector<double> g0 = *rk.gradient;
+        double h = 1e-6, maxerr = 0;
+        for (int k = 0; k < 2 * n + 2; k++) {
+            Ranker rp(n, p), rm(n, p);
+            rp.params(k) += h; rm.params(k) -= h;
+            rp.ties = rk.ties; rm.ties = rk.ties;
+            rp.evaluate(obs); rm.evaluate(obs);
+            maxerr = std::max(maxerr, std::fabs((*rp.val - *rm.val) / (2 * h) - g0(k)));
+        }
+        std::cout << (tie_on ? "ties   " : "no-ties") << ": val=" << v0 << "  FD grad max err=" << std::scientific << maxerr << std::fixed << "\n";
+    }
+    // fit with ties and report the tie posterior
+    Ranker rk(n, p);
+    rk.ties = TieModel::load(atomfile);
+    rk.fit(obs);
+    double Eλ = 0; for (int j = 0; j < rk.ties->J; j++) Eλ += rk.ties->w[j] * rk.ties->λ[j];
+    std::cout << "fitted: val=" << *rk.val << "  E[λ]=" << Eλ << "\nmu=";
+    for (int i = 0; i < n; i++) std::cout << rk.params(i) << " ";
+    std::vector<double> mu(n), sg(n);
+    for (int i = 0; i < n; i++) { mu[i] = rk.params(i); sg[i] = exp(rk.params(n + i)); }
+    auto bp = select_eig_ties(mu, sg, n, *rk.ties);
+    std::cout << "\nEIG3 selected pair=(" << bp.first << "," << bp.second << ")\n";
+    return 0;
+}
+
+// ----- tiebench: time a single fit with tie support -----
+static int tiebench(const std::string& atomfile, int nb, int count, double λtrue) {
+    Instance inst = Instance::random(nb);
+    Observations obs(nb, inst, count, λtrue);
+    ublas::vector<double> params(2 * nb + 2);
+    double s0 = init_sigma();
+    for (int i = 0; i < nb; i++) { params(i) = 0.0; params(nb + i) = log(s0); }
+    params(2 * nb) = log(Mα); params(2 * nb + 1) = log(Mβ);
+    Ranker ranker(nb, params);
+    ranker.ties = TieModel::load(atomfile);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    ranker.fit(obs, 1e-8, 1e6, false);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double Eλ = 0; for (int j = 0; j < ranker.ties->J; j++) Eλ += ranker.ties->w[j] * ranker.ties->λ[j];
+    std::vector<double> mu(nb), z(nb);
+    for (int i = 0; i < nb; i++) { mu[i] = ranker.params(i); z[i] = inst.z(i); }
+    std::cout << "n=" << nb << " comparisons=" << count << " λ*=" << λtrue
+              << "  fit " << std::chrono::duration<double>(t1 - t0).count() << " s"
+              << "  E[λ]=" << Eλ << "  inversions=" << actual_inversions(mu, z, nb) << "\n";
+    return 0;
+}
+
 // ----- one experiment run; fills traj[strat][step] for this run -----
 static const int MAXSTEPS = 2048;   // trajectory buffer size; steps must not exceed this
 static void run_once(int n, int steps, unsigned long seed, double traj[4][MAXSTEPS]) {
@@ -925,6 +1207,13 @@ int main(int argc, char ** argv) {
     std::string mode = argc > 1 ? argv[1] : "verify";
     if (mode == "verify") return verify();
     if (mode == "verify2") return verify2();
+    if (mode == "verify3") return verify3(argc > 2 ? argv[2] : TIE_ATOMS_DEFAULT);
+    if (mode == "tiebench") {   // tiebench <n> <comparisons> <lambda_true> [atomfile]
+        int nb = argc > 2 ? atoi(argv[2]) : 200;
+        int count = argc > 3 ? atoi(argv[3]) : 160000;
+        double λt = argc > 4 ? atof(argv[4]) : 0.75;
+        return tiebench(argc > 5 ? argv[5] : TIE_ATOMS_DEFAULT, nb, count, λt);
+    }
     if (mode == "n3test") {
         const int n = 3;
         ublas::vector<double> params(2 * n + 2);

@@ -276,6 +276,7 @@ The constant $Cst$ collects the normalising terms that do not depend on the vari
 
 
 \subsection{The logistic-normal integral}
+\label{sec:integral}
 
 As it turns out, we can express most of the integrals above in terms of elementary functions, as well as the polygamma function $\psi$.
 The integral
@@ -559,6 +560,82 @@ The same gradient can be used as a heuristic to guide a deeper tree search over 
 future comparisons, and a candidate pair's predicted gain can be verified by actually refitting
 the model with the hypothetical observation added, at the cost of one extra fit per pair.
 
+\section{Extension: comparisons with ties}
+\label{sec:ties}
+
+Many comparison domains produce a third outcome: a draw, or a judge declaring two items too close
+to call. We extend the model to ties following Davidson \cite{davidson1970ties}, which adds a
+single tie parameter $\lambda \ge 0$ to the Bradley--Terry likelihood. With
+$A = 2\cosh(\delta/2)$ and $\delta = z_i - z_j$,
+\begin{equation*}
+    P(i \text{ wins}) = \frac{e^{\delta/2}}{A + \lambda}, \qquad
+    P(\text{tie}) = \frac{\lambda}{A + \lambda}, \qquad
+    P(j \text{ wins}) = \frac{e^{-\delta/2}}{A + \lambda},
+\end{equation*}
+so $\lambda = 0$ recovers the tie-free model exactly. We choose Davidson over the
+threshold model of Rao and Kupper \cite{rao1967ties} because $\lambda$ enters the normalizer
+\emph{additively}, which is what lets the closed form survive below. (The models differ mildly in
+their tails: Davidson's tie probability decays as $e^{-|\delta|/2}$ against Rao--Kupper's
+$e^{-|\delta|}$, so Davidson allows relatively more draws between mismatched items.)
+
+\paragraph{A particle posterior for the tie parameter.}
+The tie propensity is a domain property we do not know a priori, so $\lambda$ is treated as a
+random variable. We place the prior on the \emph{observable} quantity
+$p_0 = \lambda/(2+\lambda)$ --- the tie probability between equally matched items --- as
+$p_0 \sim \mathrm{Beta}(a, b)$, uniform by default, and discretise: the variational posterior
+over $\lambda$ is a categorical distribution over $J$ atoms $\lambda_j$ placed at the prior's
+$(j-\tfrac12)/J$ quantiles, so that each atom carries prior mass exactly $1/J$. The prior thus
+determines the grid; there are no arbitrary bounds, and the discretisation refines automatically
+with $J$. Since $\lambda$ is a weakly identified nuisance --- we verify below that the ranking is
+insensitive even to substantial misestimation of $\lambda$ --- gridding it is benign, and $J = 16$
+is ample.
+
+\paragraph{The closed form survives.}
+All three outcomes share one normalizer, $\log(A + \lambda)$, whose expectation splits as
+\begin{equation*}
+    \mathbb{E}_{\delta}\big[\log(A + \lambda)\big]
+    = \frac{\mu_\delta}{2} + F(\mu_\delta, \sigma_\delta) + \mathbb{E}_{\delta}\big[b_\lambda(\delta)\big],
+    \quad
+    b_\lambda(\delta) = \log\!\Big(1 + \frac{\lambda}{2\cosh(\delta/2)}\Big),
+\end{equation*}
+where $F$ is exactly the kernel of Section~\ref{sec:integral} --- the tie-free machinery is reused
+untouched --- and $b_\lambda$ is an even, exponentially decaying bump. Each atom's bump is fitted
+once, offline, in a shared basis $\{e^{-a_l\delta^2},\, a_l\delta^2 e^{-a_l\delta^2}\}$ of $L=20$
+widths, to sup error $\sim 10^{-11}$ across the whole atom range; each basis function integrates
+against the Gaussian in closed form, exactly like the correction terms of
+Section~\ref{sec:correction}, and with the same derivative structure. Because the expectation is
+linear in the categorical weights $w_j$, the mixture premixes into a single set of coefficients
+$\bar p = \sum_j w_j p_j$ once per iteration: the per-pair cost is \emph{independent of} $J$, and
+in practice roughly doubles the observation term of the tie-free model.
+
+\paragraph{Learning the weights.}
+The expected log-likelihood is \emph{linear} in $w$, so the optimal categorical factor given the
+scores has the exact coordinate-ascent form
+\begin{equation*}
+    w_j \;\propto\; \pi_j \exp\Big( n_t \log\lambda_j
+      - \sum_{\text{pairs}} c_{ij}\, \mathbb{E}_{\delta}\big[b_{\lambda_j}(\delta)\big] \Big),
+\end{equation*}
+where $n_t$ is the total tie count and $c_{ij}$ the pair's comparison count. Fitting alternates
+Newton steps over $(\mu, \sigma, \alpha, \beta)$ with this closed-form update --- typically two or
+three rounds --- and the required per-atom expectations reuse the basis integrals already computed,
+so the update itself costs $O(JL)$ regardless of the number of observations. Active selection
+carries over by replacing the binary information gain with its three-outcome analogue; the
+$\lambda$-mixed outcome probabilities depend on $\delta$ alone, so they are tabulated once per
+selection and the per-candidate cost again does not grow with $J$.
+
+\paragraph{Verification and behaviour.}
+The tie terms match an independent quadrature of the exact integrands to $6\times10^{-7}$ (the
+accuracy of the $k=5$ correction times the observation count), and the gradient and Hessian match
+central differences to $\sim10^{-8}$ in both implementations. On synthetic Davidson data
+($n = 30$, $3000$ comparisons, true $\lambda^\ast = 0.75$, a $27\%$ tie rate between equals) the
+posterior mean of $\lambda$ recovers $0.78$. Two observations from longer active-selection runs
+are worth recording. First, the ranking is remarkably insensitive to the tie parameter: even a
+deliberately coarse two-atom grid that misestimates $\lambda$ several-fold ranks as well as a fine
+grid --- consistent with $\lambda$ being, like the scale $\nu$, a nuisance the ranking barely
+feels. Second, a model that ignores ties must discard tie observations, and ties carry real
+information (``these two are close''); tie-aware runs matched or slightly beat the tie-discarding
+baseline on final inversions in our experiments.
+
 \section{Experiments}
 \label{sec:experiments}
 
@@ -636,9 +713,11 @@ fast enough to scale to many items or to support deep backtracking search, and a
 that is differentiable in the data, which we exploit for active next-pair selection. Our
 experiments confirm that the approximation closely matches an exact-model MCMC reference.
 
-The model could be extended to richer outcomes --- draws, more than two competitors per match,
-and scores that drift over time --- much as TrueSkill \cite{herbrich2007trueskill} handles these;
-whether the closed form survives these extensions is an open and tempting question.
+The model extends to richer outcomes. Section~\ref{sec:ties} shows that the closed form survives
+the addition of draws: Davidson's tie parameter, made fully Bayesian by a particle posterior,
+adds a single premixed kernel per pair, at a cost independent of the number of particles.
+Matches with more than two competitors, and scores that drift over time --- much as TrueSkill
+\cite{herbrich2007trueskill} handles these --- remain open and tempting questions.
 
 \printbibliography
 
