@@ -1,5 +1,6 @@
+import os
 from scipy.stats import invgamma, norm
-from scipy.special import gammaln, polygamma, erf, erfc, expit
+from scipy.special import gammaln, polygamma, erf, erfc, expit, xlogy
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import LinearOperator, cg
 from numpy import log, sqrt, exp, sign, pi as π
@@ -73,6 +74,25 @@ def correction(μδ, σδ, order=2):
     return bump_eval(CORR_A, CORR_C, CORR_C, μδ, σδ, order)
 
 
+def F_kernel(μδ, σδ, order=2):
+    """F(μδ, σδ) = ∫ N(μδ, σδ²) log(1+e^{-δ}) dδ  --- the error-function approximation plus the
+    k-term correction --- with PLAIN derivatives: returns (F, Fμ, Fσ, Fμμ, Fμσ, Fσσ).
+    Single source of truth for the observation kernel: the Bradley-Terry loop and the tie block
+    both consume it (the former negates where its legacy conventions store -dF/dσδ and -d²F).
+    order=0 returns only F (derivatives 0)."""
+    h = sqrt(16/π + 2 * σδ**2)
+    Tc, tμ, tσ, tμμ, tμσ, tσσ = correction(μδ, σδ, order)
+    F = exp(-(μδ/h)**2) * h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h)) + Tc
+    if order == 0:
+        return F, 0.0, 0.0, 0.0, 0.0, 0.0
+    Fμ = - 1 / 2 * (1 - erf(μδ / h)) + tμ
+    Fσ = exp(-(μδ/h)**2) * σδ / (sqrt(π) * h) + tσ
+    Fμμ = exp(-(μδ/h)**2) / (sqrt(π) * h) + tμμ
+    Fμσ = - 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3) + tμσ
+    Fσσ = exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + π * μδ**2)) / (π**(5/2) * h**5) + tσσ
+    return F, Fμ, Fσ, Fμμ, Fμσ, Fσσ
+
+
 class TieModel():
     """Davidson tie model: comparisons have three outcomes, with a tie parameter λ ≥ 0:
         P(i wins) = e^{δ/2}/(A+λ),  P(tie) = λ/(A+λ),  A = 2 cosh(δ/2),  δ = z_i - z_j,
@@ -84,7 +104,11 @@ class TieModel():
     are closed-form (bump_eval), so the w-mixture premixes into ONE kernel call per pair: the
     per-pair cost is independent of J."""
 
-    def __init__(self, path="fit_results/tie_atoms_J16.txt"):
+    DEFAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "fit_results", "tie_atoms_J16.txt")
+
+    def __init__(self, path=None):
+        path = path if path is not None else TieModel.DEFAULT_PATH
         with open(path) as f:
             J, L = map(int, f.readline().split())
             self.J, self.L = J, L
@@ -114,14 +138,19 @@ class TieModel():
 
 def tie_pairs(obs, tie_obs, n):
     """Aggregate directed win counts and tie counts into unordered pairs:
-    {(a, b): [n_w, n_l, n_t]} with a < b, n_w = wins of a over b."""
+    {(a, b): [n_w, n_l, n_t]} with a < b, n_w = wins of a over b.  Tie counts are accepted in
+    either triangle (canonicalised here); diagonal entries are skipped."""
     d = {}
     for (count, i, j) in zip(obs.data, obs.row, obs.col):
+        if i == j:
+            continue
         a, b = (i, j) if i < j else (j, i)
         e = d.setdefault((a, b), [0, 0, 0])
         e[0 if i < j else 1] += count
     if tie_obs is not None:
         for (count, i, j) in zip(tie_obs.data, tie_obs.row, tie_obs.col):
+            if i == j:
+                continue
             d.setdefault((min(i, j), max(i, j)), [0, 0, 0])[2] += count
     return d
 
@@ -393,10 +422,11 @@ class VBayes():
         self.params[2 * self.n] = model.α
         self.params[2 * self.n + 1] = model.β
 
-    def enable_ties(self, path="fit_results/tie_atoms_J16.txt"):
+    def enable_ties(self, path=None):
         """
         Enable the Davidson tie model: observations may then include ties (pass tie_obs to
         eval/fit), and the tie parameter's categorical posterior is learned alongside the fit.
+        The atom file defaults to fit_results/tie_atoms_J16.txt resolved relative to the repo.
         """
         self.ties = TieModel(path)
 
@@ -444,14 +474,15 @@ class VBayes():
         return Instance(invgamma.rvs(self.α()[0], scale=1/self.β()[0], random_state=rng), norm.rvs(loc=self.µ(), scale=self.σ(), random_state=rng))
 
 
-    def eval(self, obs, compute_gradient = False, compute_hessian = False, dobs = None, tie_obs = None):
+    def eval(self, obs, compute_gradient = False, compute_hessian = False, dobs = None, tie_obs = None, pairs = None):
         """
         Evaluates the variational lower bound on the log-likelihood of the data.
         If compute_gradient is true, the gradient of the lower bound is computed.
         If compute_hessian is true, the hessian of the lower bound is computed.
         If dobs is not None, it is assumed to be a vector of the same size as obs and
         is used to compute the gradient of the parameters with respect to the observations.
-        If the tie model is enabled, tie_obs is an (upper-triangular) coo_matrix of tie counts.
+        If the tie model is enabled, tie_obs is a coo_matrix of tie counts (either triangle);
+        pairs may carry a precomputed tie_pairs() aggregation to avoid rebuilding it per call.
         """
         # Compute the gradient of the paramters (µ, σ, α, β) with respect to the KL divergence
         # of the approximate posterior with the true posterior.
@@ -554,21 +585,26 @@ class VBayes():
         # d²f/dadb = d²g/dc² (dc/da)(dc/db) + dg/dc d²c/(da db)
 
         if compute_hessian and not compute_gradient:
-            raise "Must compute the gradient if the hessian is being computed"
+            raise ValueError("Must compute the gradient if the hessian is being computed")
 
         if dobs is not None:
+            if self.ties is not None:
+                # the sensitivities below are Bradley-Terry only; silently using them with the
+                # tie model would bias active selection (the bump derivative is missing)
+                raise ValueError("observation sensitivities (dobs) are not implemented for the tie model")
             for i in range(self.n):
                 for j in range(self.n):
                     σδ = sqrt(σ[i]**2 + σ[j]**2)
                     μδ = μ[i] - μ[j]
-                    h = sqrt(16/π + 2 * σδ**2)
-                    _, tμ, tσ, _, _, _ = correction(μδ, σδ)
-                    gμδ = - 1 / 2 * (1 - erf(μδ / h)) + tμ # gμδ stores +dF/dμδ
-                    gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h) - tσ  # gσδ stores -dF/dσδ
-                    dobs[i, j, 0] = - gσδ  / σδ
-                    dobs[i, j, 1] = gμδ
+                    _, Fμ, Fσ, _, _, _ = F_kernel(μδ, σδ)
+                    dobs[i, j, 0] = Fσ / σδ
+                    dobs[i, j, 1] = Fμ
 
-        pairs = tie_pairs(obs, tie_obs, n) if self.ties is not None else None
+        if self.ties is not None:
+            if pairs is None:
+                pairs = tie_pairs(obs, tie_obs, n)
+        else:
+            pairs = None
         l = 6 * len(obs.data) + (6 * len(pairs) if pairs is not None else 0)
         gh.h_obs = coo_matrix((empty(l), (zeros(l,dtype=int32), zeros(l,dtype=int32))),shape=(2*n,2*n))
 
@@ -577,15 +613,14 @@ class VBayes():
 
             σδ = sqrt(σ[i]**2 + σ[j]**2) #todo, don't repeat computation with dobs if we can avoid
             μδ = μ[i] - μ[j]
-            h = sqrt(16/π + 2 * σδ**2)
 
-            Tc, tμ, tσ, tμμ, tμσ, tσσ = correction(μδ, σδ, 2 if compute_gradient else 0)
-            gh.val += count * (exp(-(μδ/h)**2) *  h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h)) + Tc)
+            F, Fμ, Fσ, Fμμ, Fμσ, Fσσ = F_kernel(μδ, σδ, 2 if compute_gradient else 0)
+            gh.val += count * F
 
             if compute_gradient:
 
-                gμδ = - 1 / 2 * (1 - erf(μδ / h)) + tμ # gμδ stores +dF/dμδ, so + correction
-                gσδ = - exp(-(μδ/h)**2) * σδ / (sqrt(π) * h) - tσ  # gσδ stores -dF/dσδ, so - correction
+                gμδ = Fμ    # gμδ stores +dF/dμδ
+                gσδ = - Fσ  # gσδ stores -dF/dσδ (legacy sign convention of this loop)
 
                 gh.gμ()[i] -= count * (-gμδ)
                 gh.gμ()[j] -= count * gμδ
@@ -596,9 +631,9 @@ class VBayes():
 
                 if compute_hessian:
 
-                    hμμδ = - exp(-(μδ/h)**2) / (sqrt(π) * h) - tμμ   # h*δ store -d²F, so - correction
-                    hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3) - tμσ
-                    hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + π * μδ**2)) / (π**(5/2) * h**5) - tσσ
+                    hμμδ = - Fμμ    # h*δ store the NEGATED second derivatives (legacy convention)
+                    hμσδ = - Fμσ
+                    hσσδ = - Fσσ
 
                     # Diagonal terms, hμiμi, hμjμj, hσiσi, hσjσj
                     gh.h_diag[i] -= count * hμμδ
@@ -652,19 +687,18 @@ class VBayes():
         # Derivatives below are PLAIN (Tμ = d/dμδ etc.), chained to (μ_a, μ_b, σ_a, σ_b).
         if pairs is not None:
             t = self.ties
+            # the categorical factor's KL against its prior: part of the bound (constant during
+            # Newton, but required for val to be the true -ELBO and monotone across CAVI rounds)
+            gh.val += xlogy(t.w, t.w / t.π).sum()
+            order = 2 if compute_gradient else 0
             for (a, b), (n_w, n_l, n_t) in pairs.items():
                 c = n_w + n_l + n_t
                 σδ = sqrt(σ[a]**2 + σ[b]**2)
                 μδ = μ[a] - μ[b]
-                h = sqrt(16/π + 2 * σδ**2)
-                order = 2 if compute_gradient else 0
                 B, Bμ, Bσ, Bμμ, Bμσ, Bσσ = bump_eval(t.a, t.pmix, t.qmix, μδ, σδ, order)
-                Tc, tμ, tσ, tμμ, tμσ, tσσ = correction(μδ, σδ, order)
-                F = exp(-(μδ/h)**2) * h / (2 * sqrt(π)) - 1/2 * μδ * (1 - erf(μδ/h)) + Tc
+                F, Fμ, Fσ, Fμμ, Fμσ, Fσσ = F_kernel(μδ, σδ, order)
                 gh.val += n_t * F + c * B + n_t * μδ / 2 - n_t * t.wlogλ
                 if compute_gradient:
-                    Fμ = - 1/2 * (1 - erf(μδ/h)) + tμ
-                    Fσ = exp(-(μδ/h)**2) * σδ / (sqrt(π) * h) + tσ
                     Tμ = n_t * Fμ + c * Bμ + n_t / 2
                     Tσ = n_t * Fσ + c * Bσ
                     gh.gμ()[a] += Tμ
@@ -672,9 +706,6 @@ class VBayes():
                     gh.gσ()[a] += Tσ * σ[a] / σδ
                     gh.gσ()[b] += Tσ * σ[b] / σδ
                     if compute_hessian:
-                        Fμμ = exp(-(μδ/h)**2) / (sqrt(π) * h) + tμμ
-                        Fμσ = - 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3) + tμσ
-                        Fσσ = exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + π * μδ**2)) / (π**(5/2) * h**5) + tσσ
                         Tμμ = n_t * Fμμ + c * Bμμ
                         Tμσ = n_t * Fμσ + c * Bμσ
                         Tσσ = n_t * Fσσ + c * Bσσ
@@ -700,7 +731,7 @@ class VBayes():
             raise ValueError("NaN in hessian")
         return gh
 
-    def cavi(self, obs, tie_obs=None):
+    def cavi(self, obs, tie_obs=None, pairs=None):
         """
         Exact CAVI coordinate update of the tie-atom weights (the data term is linear in w):
             w_j ∝ π_j exp( (Σ n_t) log λ_j - Σ_pairs c · E[b_{λ_j}] ).
@@ -713,7 +744,9 @@ class VBayes():
         σ, μ = self.σ(), self.μ()
         accp, accq = zeros(t.L), zeros(t.L)
         nt_tot = 0
-        for (a, b), (n_w, n_l, n_t) in tie_pairs(obs, tie_obs, self.n).items():
+        if pairs is None:
+            pairs = tie_pairs(obs, tie_obs, self.n)
+        for (a, b), (n_w, n_l, n_t) in pairs.items():
             c = n_w + n_l + n_t
             nt_tot += n_t
             σδ2 = σ[a]**2 + σ[b]**2
@@ -739,14 +772,21 @@ class VBayes():
         weights until the weights are stationary.
         """
         if self.ties is not None:
+            pairs = tie_pairs(obs, tie_obs, self.n)   # built once per fit, reused by eval and cavi
+            dw = np.inf
             for _ in range(8):
-                self.newton(obs, max_iter, tol, verbose, λ0, λmax, tie_obs)
-                if self.cavi(obs, tie_obs) < 1e-9:
+                self.newton(obs, max_iter, tol, verbose, λ0, λmax, tie_obs, pairs)
+                dw = self.cavi(obs, tie_obs, pairs)
+                if dw < 1e-9:
                     break
+            if dw >= 1e-9:
+                # the weights moved after the last Newton pass: refit the scores against them so
+                # the returned parameters always correspond to the stored weights
+                self.newton(obs, max_iter, tol, verbose, λ0, λmax, tie_obs, pairs)
             return
         return self.newton(obs, max_iter, tol, verbose, λ0, λmax, tie_obs)
 
-    def newton(self, obs, max_iter=100000, tol=1e-8, verbose=True, λ0 = 1e-10, λmax = 10000, tie_obs=None):
+    def newton(self, obs, max_iter=100000, tol=1e-8, verbose=True, λ0 = 1e-10, λmax = 10000, tie_obs=None, pairs=None):
         """
         Newton-CG over (μ, σ, α, β) at fixed tie weights.
         """
@@ -754,7 +794,7 @@ class VBayes():
         last_val = None
         λ = λ0                       # carried across iterations so the test below sees the damping the
         for _ in range(max_iter):    # previous step actually needed (it is reset to λ0 after the test)
-            gh = self.eval(obs, compute_gradient=True, compute_hessian=True, tie_obs=tie_obs)
+            gh = self.eval(obs, compute_gradient=True, compute_hessian=True, tie_obs=tie_obs, pairs=pairs)
             # don't stop if we're still dampening the hessian, but do stop if it's gone too far
             if (last_val and abs(last_val - gh.val)/abs(gh.val) < tol and λ == λ0) or λ > λmax:
                 break
@@ -794,30 +834,34 @@ class VBayes():
                 gh.h_obs.data[k] *= sd[i] * sd[j]
             gh.g *= sd
 
+            old_params = self.params.copy()   # hoisted: the except path must restore too
             while True:
                 try:
                     gh.h_diag *= (1 + λ)
-                    diff = sd * cg(gh.h, gh.g, rtol=1e-8, atol=1e-12)[0]
-                    gh.h_diag /= (1 + λ)
+                    try:
+                        diff = sd * cg(gh.h, gh.g, rtol=1e-8, atol=1e-12)[0]
+                    finally:
+                        gh.h_diag /= (1 + λ)   # never leave the damping applied
 
-                    old_params = self.params.copy()
                     self.params[:self.n] -= diff[:self.n]
                     factor = exp(-diff[self.n:])
                     self.params[self.n:] *= factor
 
 
-                    if self.eval(obs, tie_obs=tie_obs).val < gh.val: # if it's better stop
+                    if self.eval(obs, tie_obs=tie_obs, pairs=pairs).val < gh.val: # if it's better stop
                         if verbose and λ > λ0:
                             print(f"λ = {λ}")
                         break
 
                     else:
-                        self.params = old_params
+                        self.params = old_params.copy()
                         λ *= 10 # otherwise increase the conditioning
                         if λ > λmax:
-                            break # no decreasing step exists: we are at the optimum
+                            break # no decreasing step found: treat as converged
 
                 except RuntimeWarning:
+                    # a trial step may have overflowed mid-mutation: restore before retrying/leaving
+                    self.params = old_params.copy()
                     λ *= 10
                     if λ > λmax:
                         break
@@ -928,6 +972,10 @@ class VBayes():
 
         #TODO: consider using a tree search
 
+        if self.ties is not None:
+            # requires tie-aware sensitivities (dobs), 3-outcome win/tie/loss branches, and the
+            # Davidson predictive; the C++ implementation's select_eig_ties covers selection
+            raise NotImplementedError("best_pair does not support the tie model yet")
         self.fit(verbose=False, obs=obs)
         dobs = zeros((self.n, self.n, 2))
         gh = self.eval(obs,compute_gradient=True,compute_hessian=True, dobs=dobs)

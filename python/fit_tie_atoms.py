@@ -62,6 +62,9 @@ for j, lam in enumerate(lams):
     sups.append(np.max(np.abs(P @ coef - y)))
 
 # --- validate the closed-form Gaussian integrals against quadrature ---
+# NB: closed() intentionally duplicates models.bump_eval's order-0 branch so this script stays
+# standalone; if the basis parameterization changes there (or in CC/ranker.cc), update here too,
+# or the validation below silently checks the wrong closed form.
 def closed(mu, sig, pq):
     p, q = pq[:L], pq[L:]
     D = 1 + 2 * A * sig ** 2

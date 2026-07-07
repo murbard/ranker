@@ -215,38 +215,46 @@ class Observations {
 struct TieModel {
     int J = 0, L = 0;
     std::vector<double> a;                    // L shared widths
-    std::vector<double> λ, logλ, π;           // J atoms: location, log, prior mass
+    std::vector<double> λ, logλ, π, logπ;     // J atoms: location, log, prior mass, its log
     std::vector<double> P, Q;                 // (J × L) coefficients, atom j at [j*L, j*L+L)
     std::vector<double> w;                    // categorical posterior weights
-    std::vector<double> p̄, q̄;                 // premixed coefficients Σ_j w_j (P_j, Q_j)
+    std::vector<double> pmix, qmix;           // premixed coefficients Σ_j w_j (P_j, Q_j)
     double wlogλ = 0;                         // Σ_j w_j log λ_j
+    double KLwπ = 0;                          // Σ_j w_j log(w_j/π_j): the categorical KL term
 
     static TieModel load(const std::string& path) {
         TieModel t; std::ifstream f(path);
-        if (!f) throw std::runtime_error("cannot open tie atom file " + path);
+        if (!f) {
+            f.open("../" + path);             // allow running the binary from CC/
+            if (!f) throw std::runtime_error("cannot open tie atom file " + path + " (also tried ../)");
+        }
         f >> t.J >> t.L;
         t.a.resize(t.L);
         for (auto& v : t.a) f >> v;
-        t.λ.resize(t.J); t.logλ.resize(t.J); t.π.resize(t.J);
+        t.λ.resize(t.J); t.logλ.resize(t.J); t.π.resize(t.J); t.logπ.resize(t.J);
         t.P.resize((size_t)t.J*t.L); t.Q.resize((size_t)t.J*t.L);
         for (int j = 0; j < t.J; j++) {
             f >> t.λ[j] >> t.π[j];
             t.logλ[j] = log(t.λ[j]);
+            t.logπ[j] = log(t.π[j]);
             for (int l = 0; l < t.L; l++) f >> t.P[(size_t)j*t.L+l] >> t.Q[(size_t)j*t.L+l];
         }
         if (!f) throw std::runtime_error("bad tie atom file " + path);
         t.w.assign(t.J, 1.0/t.J);
-        t.p̄.resize(t.L); t.q̄.resize(t.L);
+        t.pmix.resize(t.L); t.qmix.resize(t.L);
         t.premix();
         return t;
     }
     void premix() {
-        wlogλ = 0;
-        for (int j = 0; j < J; j++) wlogλ += w[j]*logλ[j];
+        wlogλ = 0; KLwπ = 0;
+        for (int j = 0; j < J; j++) {
+            wlogλ += w[j]*logλ[j];
+            if (w[j] > 0) KLwπ += w[j]*(log(w[j]) - logπ[j]);
+        }
         for (int l = 0; l < L; l++) {
             double sp = 0, sq = 0;
             for (int j = 0; j < J; j++) { sp += w[j]*P[(size_t)j*L+l]; sq += w[j]*Q[(size_t)j*L+l]; }
-            p̄[l] = sp; q̄[l] = sq;
+            pmix[l] = sp; qmix[l] = sq;
         }
     }
 };
@@ -399,22 +407,30 @@ class Ranker {
         }
 
         // visit each observed unordered pair (a<b) once with counts (n_w, n_l, n_t);
-        // tie counts participate only when the tie model is enabled
+        // tie counts participate only when the tie model is enabled and are accepted in either
+        // triangle of T (canonicalised here); diagonal entries are skipped
         template<class F>
         void each_pair(const Observations& obs, F f) const {
             const bool tie_on = bool(ties);
+            auto nt = [&](int a, int b) -> int {   // a < b; count ties stored in either triangle
+                return tie_on ? obs.T(a, b) + obs.T(b, a) : 0;
+            };
             for (auto it = obs.X.begin1(); it != obs.X.end1(); ++it)
                 for (auto el = it.begin(); el != it.end(); ++el) {
                     const int i = el.index1(), j = el.index2();
                     if (i == j) continue;
-                    if (i < j) f(i, j, *el, obs.X(j, i), tie_on ? obs.T(i, j) : 0);
-                    else if (!obs.X.find_element(j, i)) f(j, i, 0, *el, tie_on ? obs.T(j, i) : 0);
+                    if (i < j) f(i, j, *el, obs.X(j, i), nt(i, j));
+                    else if (!obs.X.find_element(j, i)) f(j, i, 0, *el, nt(j, i));
                 }
             if (tie_on)
                 for (auto it = obs.T.begin1(); it != obs.T.end1(); ++it)
                     for (auto el = it.begin(); el != it.end(); ++el) {
-                        const int a = el.index1(), b = el.index2();
-                        if (!obs.X.find_element(a, b) && !obs.X.find_element(b, a)) f(a, b, 0, 0, *el);
+                        const int i = el.index1(), j = el.index2();
+                        if (i == j) continue;
+                        const int a = std::min(i, j), b = std::max(i, j);
+                        if (i > j && obs.T.find_element(a, b)) continue;   // counted at the upper entry
+                        if (obs.X.find_element(a, b) || obs.X.find_element(b, a)) continue;  // handled above
+                        f(a, b, 0, 0, nt(a, b));
                     }
         }
         std::string print_gradient() {
@@ -569,6 +585,9 @@ class Ranker {
             // where E[b_λ] is the premixed tie bump (absent without tie support).  For n_t = 0 this
             // equals the Bradley-Terry  n_w F(μδ) + n_l F(−μδ)  exactly, since F(−μ) = μ + F(μ).
             const bool tie_on = bool(ties);
+            const double wlogλ = tie_on ? ties->wlogλ : 0.0;   // loop-invariant
+            if (tie_on) v += ties->KLwπ;   // categorical KL: constant during Newton, but needed
+                                           // for v to be the true -ELBO and monotone across CAVI
             coordinate_matrix<double> hobs(2 * n, 2 * n, (obs.X.nnz() + obs.T.nnz()) * 6);
 
             each_pair(obs, [&](int i, int j, int n_w, int n_l, int n_t) {
@@ -585,7 +604,7 @@ class Ranker {
                     correction(μδ, σδ, compute_gradient ? 2 : 0, Tc, tμ, tσ, tμμ, tμσ, tσσ);
                     if (tie_on) {   // premixed atom bumps enter exactly like the correction terms
                         double Bt, bμ, bσ, bμμ, bμσ, bσσ;
-                        bump_eval(ties->L, ties->a.data(), ties->p̄.data(), ties->q̄.data(), μδ, σδ,
+                        bump_eval(ties->L, ties->a.data(), ties->pmix.data(), ties->qmix.data(), μδ, σδ,
                                   compute_gradient ? 2 : 0, Bt, bμ, bσ, bμμ, bμσ, bσσ);
                         Tc += Bt; tμ += bμ; tσ += bσ; tμμ += bμμ; tμσ += bμσ; tσσ += bσσ;
                     }
@@ -596,7 +615,7 @@ class Ranker {
                     // F_erf + correction; write F_erf explicitly rather than reuse the augmented gμδ
                     v += count * (exp_minus_μδ_over_h_square * h / (2 * sqrt(M_PI))
                                   - 0.5 * μδ * (1 - erf(μδ_over_h)) + Tc)
-                         + lin * μδ - (tie_on ? n_t * ties->wlogλ : 0.0);
+                         + lin * μδ - n_t * wlogλ;
 
                     if (compute_gradient) {
                         // dv/dμi, dv/dμj
@@ -701,13 +720,15 @@ class Ranker {
             if (!ties) return 0.0;
             TieModel& t = *ties;
             const int J = t.J, L = t.L;
+            std::vector<double> s2c(n);                    // hoisted: n exp calls, not 2 per pair
+            for (int i = 0; i < n; i++) s2c[i] = exp(2*params(n+i));
             std::vector<double> accp(L, 0.0), accq(L, 0.0), φp(L), φq(L);
             double nt_tot = 0;
             each_pair(obs, [&](int a, int b, int n_w, int n_l, int n_t) {
                 const int count = n_w + n_l + n_t;
                 if (count == 0) return;
                 nt_tot += n_t;
-                const double σδ = sqrt(exp(2*params(n+a)) + exp(2*params(n+b)));
+                const double σδ = sqrt(s2c[a] + s2c[b]);
                 const double μδ = params(a) - params(b);
                 basis_phi(L, t.a.data(), μδ, σδ, φp.data(), φq.data());
                 for (int l = 0; l < L; l++) { accp[l] += count*φp[l]; accq[l] += count*φq[l]; }
@@ -717,7 +738,7 @@ class Ranker {
             for (int j = 0; j < J; j++) {
                 double s = 0;
                 for (int l = 0; l < L; l++) s += t.P[(size_t)j*L+l]*accp[l] + t.Q[(size_t)j*L+l]*accq[l];
-                vj[j] = nt_tot*t.logλ[j] - s + log(t.π[j]);
+                vj[j] = nt_tot*t.logλ[j] - s + t.logπ[j];
                 mx = std::max(mx, vj[j]);
             }
             double Z = 0, dw = 0;
@@ -733,10 +754,14 @@ class Ranker {
 
         void fit(const Observations& obs, const double tol = 1e-8, const int max_iter = 1e6, const bool verbose = false) {
             if (!ties) { newton(obs, tol, max_iter, verbose); return; }
-            for (int r = 0; r < 8; r++) {          // alternate Newton and the exact w-update
+            double dw = 1.0;
+            for (int r = 0; r < 8 && dw >= 1e-9; r++) {   // alternate Newton and the exact w-update
                 newton(obs, tol, max_iter, verbose);
-                if (cavi(obs) < 1e-9) break;
+                dw = cavi(obs);
             }
+            // if the cap bound, the weights moved after the last Newton pass: refit the scores so
+            // the returned parameters (and cached val/gradient/hessian) match the stored weights
+            if (dw >= 1e-9) newton(obs, tol, max_iter, verbose);
         }
 };
 
@@ -927,9 +952,11 @@ static std::pair<int,int> select_eig(const std::vector<double>& mu, const std::v
 }
 
 // ---- 3-outcome EIG for the tie model ----
-// The λ-mixed outcome probabilities and conditional entropy depend on δ only, so they are
-// tabulated once per selection (cost ∝ J, shared across all candidate pairs); each candidate
-// then costs 21 interpolated Gauss-Hermite nodes, independent of J.
+// Targets information about the SCORES: λ is marginalised out of the predictive before the
+// entropy is taken (Hc stores H3 of the λ-mixed probabilities), so the gain is MI(outcome; δ)
+// and no comparisons are spent learning the nuisance λ.  The λ-mixed quantities depend on δ
+// only, so they are tabulated once per selection (cost ∝ J, shared across all candidate pairs);
+// each candidate then costs 21 interpolated Gauss-Hermite nodes, independent of J.
 static inline double xlogx(double p) { return p > 1e-300 ? p*log(p) : 0.0; }
 static inline double H3(double pw, double pt) {
     double pl = 1.0 - pw - pt;
@@ -943,12 +970,13 @@ struct TieEigTable {
         Pw.assign(NPTS, 0); Pt.assign(NPTS, 0); Hc.assign(NPTS, 0);
         for (int k = 0; k < NPTS; k++) {
             double d = LO + STEP*k, A = 2*cosh(d/2), e = exp(d/2);
-            double pw = 0, pt = 0, hc = 0;
+            double pw = 0, pt = 0;
             for (int j = 0; j < t.J; j++) {
-                double Z = A + t.λ[j], pwj = e/Z, ptj = t.λ[j]/Z;
-                pw += t.w[j]*pwj; pt += t.w[j]*ptj; hc += t.w[j]*H3(pwj, ptj);
+                double Z = A + t.λ[j];
+                pw += t.w[j]*e/Z; pt += t.w[j]*t.λ[j]/Z;
             }
-            Pw[k] = pw; Pt[k] = pt; Hc[k] = hc;
+            Pw[k] = pw; Pt[k] = pt;
+            Hc[k] = H3(pw, pt);   // entropy OF the λ-marginalised predictive: score-targeted MI
         }
     }
     inline void interp(double d, double& pw, double& pt, double& hc) const {
@@ -1019,14 +1047,19 @@ static std::pair<int,int> select_logdomain(Ranker& rk, const Observations& obs, 
 // initial sigma per VBayes.__init__
 static double init_sigma() { return sqrt(Mβ / Mα) * (1.0 + 3.0 / (6.0 * Mα + 2.0 * Mα * Mα)); }
 
-// ----- verify2: fit the n=6 reference obs, then check the FITTED-state reference (log-native) -----
-static int verify2() {
-    int n = 6;
+// prior-mode starting point (μ=0, σ=init_sigma, α=Mα, β=Mβ), shared by fits that start cold
+static ublas::vector<double> init_params(int n) {
     ublas::vector<double> p(2 * n + 2);
     double s0 = init_sigma();
     for (int i = 0; i < n; i++) { p(i) = 0.0; p(n + i) = log(s0); }
     p(2 * n) = log(Mα); p(2 * n + 1) = log(Mβ);
-    Ranker rk(n, p);
+    return p;
+}
+
+// ----- verify2: fit the n=6 reference obs, then check the FITTED-state reference (log-native) -----
+static int verify2() {
+    int n = 6;
+    Ranker rk(n, init_params(n));
     Observations obs(n);
     int O[9][3] = {{0,1,3},{1,0,1},{2,3,2},{0,4,2},{4,5,1},{5,2,2},{3,1,1},{2,5,2},{4,0,1}};
     for (auto& o : O) obs.X(o[0], o[1]) = o[2];
@@ -1139,10 +1172,10 @@ static int verify3(const std::string& atomfile) {
     rk.ties = TieModel::load(atomfile);
     rk.fit(obs);
     double Eλ = 0; for (int j = 0; j < rk.ties->J; j++) Eλ += rk.ties->w[j] * rk.ties->λ[j];
-    std::cout << "fitted: val=" << *rk.val << "  E[λ]=" << Eλ << "\nmu=";
-    for (int i = 0; i < n; i++) std::cout << rk.params(i) << " ";
     std::vector<double> mu(n), sg(n);
     for (int i = 0; i < n; i++) { mu[i] = rk.params(i); sg[i] = exp(rk.params(n + i)); }
+    std::cout << "fitted: val=" << *rk.val << "  E[λ]=" << Eλ << "\nmu=";
+    for (int i = 0; i < n; i++) std::cout << mu[i] << " ";
     auto bp = select_eig_ties(mu, sg, n, *rk.ties);
     std::cout << "\nEIG3 selected pair=(" << bp.first << "," << bp.second << ")\n";
     return 0;
@@ -1152,11 +1185,7 @@ static int verify3(const std::string& atomfile) {
 static int tiebench(const std::string& atomfile, int nb, int count, double λtrue) {
     Instance inst = Instance::random(nb);
     Observations obs(nb, inst, count, λtrue);
-    ublas::vector<double> params(2 * nb + 2);
-    double s0 = init_sigma();
-    for (int i = 0; i < nb; i++) { params(i) = 0.0; params(nb + i) = log(s0); }
-    params(2 * nb) = log(Mα); params(2 * nb + 1) = log(Mβ);
-    Ranker ranker(nb, params);
+    Ranker ranker(nb, init_params(nb));
     ranker.ties = TieModel::load(atomfile);
     auto t0 = std::chrono::high_resolution_clock::now();
     ranker.fit(obs, 1e-8, 1e6, false);
@@ -1182,13 +1211,9 @@ static void run_once(int n, int steps, unsigned long seed, double traj[4][MAXSTE
     double v = 1.0 / gg();
     std::vector<double> z(n);
     for (int i = 0; i < n; i++) z[i] = ng() * sqrt(v);
-    double s0 = init_sigma();
     for (int strat = 0; strat < 4; strat++) {  // 0 random,1 eig,2 var,3 inv
         Observations obs(n);
-        ublas::vector<double> p(2 * n + 2);
-        for (int i = 0; i < n; i++) { p(i) = 0.0; p(n + i) = log(s0); }
-        p(2 * n) = log(Mα); p(2 * n + 1) = log(Mβ);
-        Ranker rk(n, p);
+        Ranker rk(n, init_params(n));
         for (int t = 0; t < steps; t++) {
             rk.fit(obs);
             std::vector<double> mu, sg; double al, be; extract(rk.params, n, mu, sg, al, be);

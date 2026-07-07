@@ -616,10 +616,13 @@ scores has the exact coordinate-ascent form
       - \sum_{\text{pairs}} c_{ij}\, \mathbb{E}_{\delta}\big[b_{\lambda_j}(\delta)\big] \Big),
 \end{equation*}
 where $n_t$ is the total tie count and $c_{ij}$ the pair's comparison count. Fitting alternates
-Newton steps over $(\mu, \sigma, \alpha, \beta)$ with this closed-form update --- typically two or
-three rounds --- and the required per-atom expectations reuse the basis integrals already computed,
-so the update itself costs $O(JL)$ regardless of the number of observations. Active selection
-carries over by replacing the binary information gain with its three-outcome analogue; the
+Newton steps over $(\mu, \sigma, \alpha, \beta)$ with this closed-form update --- a handful of
+rounds in practice, capped and always ending on a Newton pass so the returned scores match the
+stored weights. The update accumulates the $L$ per-pair basis integrals in a single pass over the
+observed pairs and then costs $O(JL)$ dot products: the pass over pairs does not grow with $J$.
+Active selection carries over by replacing the binary information gain with its three-outcome
+analogue, targeting information about the scores ($\lambda$ is marginalised out of the predictive
+before the entropy is taken, so no comparisons are spent learning the nuisance); the
 $\lambda$-mixed outcome probabilities depend on $\delta$ alone, so they are tabulated once per
 selection and the per-candidate cost again does not grow with $J$.
 
