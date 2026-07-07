@@ -617,8 +617,9 @@ scores has the exact coordinate-ascent form
 \end{equation*}
 where $n_t$ is the total tie count and $c_{ij}$ the pair's comparison count. Fitting alternates
 Newton steps over $(\mu, \sigma, \alpha, \beta)$ with this closed-form update --- a handful of
-rounds in practice, capped and always ending on a Newton pass so the returned scores match the
-stored weights. The update accumulates the $L$ per-pair basis integrals in a single pass over the
+rounds in practice, at loosened intermediate tolerance, capped with a warning --- and always ends
+on a full-tolerance Newton pass, so the returned scores correspond to the stored weights. The
+update accumulates the $L$ per-pair basis integrals in a single pass over the
 observed pairs and then costs $O(JL)$ dot products: the pass over pairs does not grow with $J$.
 Active selection carries over by replacing the binary information gain with its three-outcome
 analogue, targeting information about the scores ($\lambda$ is marginalised out of the predictive
@@ -632,7 +633,7 @@ accuracy of the $k=5$ correction times the observation count), and the gradient 
 central differences to $\sim10^{-8}$ in both implementations. On synthetic Davidson data
 ($n = 30$, $3000$ comparisons, true $\lambda^\ast = 0.75$, a $27\%$ tie rate between equals) the
 posterior mean of $\lambda$ recovers $0.78$. Two observations from longer active-selection runs
-are worth recording. First, the ranking is remarkably insensitive to the tie parameter: even a
+(made with an earlier, joint-information variant of the acquisition) are worth recording. First, the ranking is remarkably insensitive to the tie parameter: even a
 deliberately coarse two-atom grid that misestimates $\lambda$ several-fold ranks as well as a fine
 grid --- consistent with $\lambda$ being, like the scale $\nu$, a nuisance the ranking barely
 feels. Second, a model that ignores ties must discard tie observations, and ties carry real

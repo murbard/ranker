@@ -118,6 +118,8 @@ class TieModel():
             self.P = empty((J, L)); self.Q = empty((J, L))
             for j in range(J):
                 vals = [float(x) for x in f.readline().split()]
+                if len(vals) != 2 + 2 * L:
+                    raise ValueError(f"bad atom line {j} in tie atom file {path}")
                 self.λ[j], self.π[j] = vals[0], vals[1]
                 self.P[j] = vals[2::2]
                 self.Q[j] = vals[3::2]
@@ -134,6 +136,15 @@ class TieModel():
     def E_λ(self):
         """Posterior mean of the tie parameter."""
         return self.w @ self.λ
+
+
+def basis_phi(A, μδ, σδ2):
+    """Order-0 per-width basis integrals (φp, φq): E[e^{-a δ²}] and E[a δ² e^{-a δ²}] against
+    N(μδ, σδ²), vectorised over the widths A.  Mirrors bump_eval's order-0 kernel (and the C++
+    basis_phi); used by cavi so the w-update integrates exactly what eval integrates."""
+    D = 1 + 2 * A * σδ2
+    E = exp(-A * μδ**2 / D) / sqrt(D)
+    return E, E * (A * μδ**2 / D**2 + A * σδ2 / D)
 
 
 def tie_pairs(obs, tie_obs, n):
@@ -602,6 +613,9 @@ class VBayes():
 
         if self.ties is not None:
             if pairs is None:
+                if tie_obs is None:
+                    raise ValueError("the tie model is enabled: pass tie_obs (an empty coo_matrix "
+                                     "if no ties were observed)")
                 pairs = tie_pairs(obs, tie_obs, n)
         else:
             pairs = None
@@ -609,12 +623,15 @@ class VBayes():
         gh.h_obs = coo_matrix((empty(l), (zeros(l,dtype=int32), zeros(l,dtype=int32))),shape=(2*n,2*n))
 
         k = 0
+        order = 2 if compute_gradient else 0
         for (count, i, j) in zip(obs.data, obs.row, obs.col):
 
+            if i == j:
+                continue   # self-comparisons carry no information (matches the C++ pair loop)
             σδ = sqrt(σ[i]**2 + σ[j]**2) #todo, don't repeat computation with dobs if we can avoid
             μδ = μ[i] - μ[j]
 
-            F, Fμ, Fσ, Fμμ, Fμσ, Fσσ = F_kernel(μδ, σδ, 2 if compute_gradient else 0)
+            F, Fμ, Fσ, Fμμ, Fμσ, Fσσ = F_kernel(μδ, σδ, order)
             gh.val += count * F
 
             if compute_gradient:
@@ -690,7 +707,6 @@ class VBayes():
             # the categorical factor's KL against its prior: part of the bound (constant during
             # Newton, but required for val to be the true -ELBO and monotone across CAVI rounds)
             gh.val += xlogy(t.w, t.w / t.π).sum()
-            order = 2 if compute_gradient else 0
             for (a, b), (n_w, n_l, n_t) in pairs.items():
                 c = n_w + n_l + n_t
                 σδ = sqrt(σ[a]**2 + σ[b]**2)
@@ -745,18 +761,19 @@ class VBayes():
         accp, accq = zeros(t.L), zeros(t.L)
         nt_tot = 0
         if pairs is None:
+            if tie_obs is None:
+                raise ValueError("the tie model is enabled: pass tie_obs (an empty coo_matrix "
+                                 "if no ties were observed)")
             pairs = tie_pairs(obs, tie_obs, self.n)
         for (a, b), (n_w, n_l, n_t) in pairs.items():
             c = n_w + n_l + n_t
             nt_tot += n_t
-            σδ2 = σ[a]**2 + σ[b]**2
-            μδ = μ[a] - μ[b]
-            D = 1 + 2 * t.a * σδ2
-            E = exp(-t.a * μδ**2 / D) / sqrt(D)
-            accp += c * E
-            accq += c * E * (t.a * μδ**2 / D**2 + t.a * σδ2 / D)
+            φp, φq = basis_phi(t.a, μ[a] - μ[b], σ[a]**2 + σ[b]**2)
+            accp += c * φp
+            accq += c * φq
         v = nt_tot * t.logλ - (t.P @ accp + t.Q @ accq) + log(t.π)
-        v = exp(v - v.max())
+        with np.errstate(under='ignore'):   # far atoms underflow benignly once data accumulates
+            v = exp(v - v.max())
         v /= v.sum()
         dw = np.max(np.abs(v - t.w))
         t.w = v
@@ -764,31 +781,40 @@ class VBayes():
         return dw
 
 
-    def fit(self, obs, max_iter=100000, tol=1e-8, verbose=True, λ0 = 1e-10, λmax = 10000, tie_obs=None):
+    def fit(self, obs, *, tol=1e-8, max_iter=100000, verbose=True, λ0 = 1e-10, λmax = 10000, tie_obs=None):
         """
         Fit the model to the observed data.
         Uses a Newton-CG algorithm to find the maximum a posteriori estimate of the parameters.
         With the tie model enabled, alternates Newton with the exact CAVI update of the tie
-        weights until the weights are stationary.
+        weights until the weights are stationary (intermediate rounds at loosened tolerance),
+        warns if the round cap binds, and always ends on a full-tolerance Newton pass so the
+        returned scores correspond to the stored weights.
+        Keyword-only tail, in the same order as the C++ implementation.
         """
         if self.ties is not None:
+            if tie_obs is None:
+                # the API cannot distinguish "no ties occurred" from "forgot to pass them";
+                # require an explicit (possibly empty) tie matrix once the tie model is enabled
+                raise ValueError("the tie model is enabled: pass tie_obs (an empty coo_matrix if "
+                                 "no ties were observed)")
             pairs = tie_pairs(obs, tie_obs, self.n)   # built once per fit, reused by eval and cavi
-            dw = np.inf
+            def step(t):
+                self.newton(obs, tol=t, max_iter=max_iter, verbose=verbose, λ0=λ0, λmax=λmax,
+                            tie_obs=tie_obs, pairs=pairs)
             for _ in range(8):
-                self.newton(obs, max_iter, tol, verbose, λ0, λmax, tie_obs, pairs)
-                dw = self.cavi(obs, tie_obs, pairs)
-                if dw < 1e-9:
+                step(max(tol, 1e-4))                  # intermediate rounds need not fully converge
+                if self.cavi(obs, tie_obs, pairs) < 1e-9:
                     break
-            if dw >= 1e-9:
-                # the weights moved after the last Newton pass: refit the scores against them so
-                # the returned parameters always correspond to the stored weights
-                self.newton(obs, max_iter, tol, verbose, λ0, λmax, tie_obs, pairs)
+            else:
+                warnings.warn("tie-weight alternation hit its 8-round cap without stationarity")
+            step(tol)                                 # always end on a full-tolerance Newton pass
             return
-        return self.newton(obs, max_iter, tol, verbose, λ0, λmax, tie_obs)
+        return self.newton(obs, tol=tol, max_iter=max_iter, verbose=verbose, λ0=λ0, λmax=λmax)
 
-    def newton(self, obs, max_iter=100000, tol=1e-8, verbose=True, λ0 = 1e-10, λmax = 10000, tie_obs=None, pairs=None):
+    def newton(self, obs, *, tol=1e-8, max_iter=100000, verbose=True, λ0 = 1e-10, λmax = 10000, tie_obs=None, pairs=None):
         """
         Newton-CG over (μ, σ, α, β) at fixed tie weights.
+        Keyword-only tail, in the same order as the C++ implementation.
         """
 
         last_val = None

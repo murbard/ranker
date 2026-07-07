@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <chrono>
+#include <iostream>
 
 // boost optional
 #include <boost/optional.hpp>
@@ -86,6 +87,28 @@ inline void bump_eval(int K, const double* A, const double* P_, const double* Q_
 inline void correction(double μδ, double σδ, int order,
                        double& T, double& tμ, double& tσ, double& tμμ, double& tμσ, double& tσσ) {
     bump_eval(CORR_K, CORR_A, CORR_C, CORR_C, μδ, σδ, order, T, tμ, tσ, tμμ, tμσ, tσσ);
+}
+
+// F(μδ, σδ) = ∫ N(μδ, σδ²) log(1+e^{-δ}) dδ --- the error-function approximation plus the k-term
+// correction --- with PLAIN derivatives.  Single source of truth for the observation kernel,
+// consumed by evaluate(), compute_dobs(), build_Hlin() and select_logdomain() (which negate where
+// their legacy conventions store -dF/dσδ and -d²F).  order==0 fills only F.
+inline void F_kernel(double μδ, double σδ, int order,
+                     double& F, double& Fμ, double& Fσ, double& Fμμ, double& Fμσ, double& Fσσ) {
+    const double h = sqrt(16.0 / M_PI + 2 * σδ * σδ);
+    const double sqrt_π_h = sqrt(M_PI) * h;
+    const double μδ_over_h = μδ / h;
+    const double e = exp(-μδ_over_h * μδ_over_h);
+    double Tc, tμ, tσ, tμμ, tμσ, tσσ;
+    correction(μδ, σδ, order, Tc, tμ, tσ, tμμ, tμσ, tσσ);
+    F = e * h / (2 * sqrt(M_PI)) - 0.5 * μδ * (1 - erf(μδ_over_h)) + Tc;
+    if (order == 0) { Fμ = Fσ = Fμμ = Fμσ = Fσσ = 0.0; return; }
+    Fμ = - 0.5 * (1 - erf(μδ_over_h)) + tμ;
+    Fσ = e * σδ / sqrt_π_h + tσ;
+    Fμμ = e / sqrt_π_h + tμμ;
+    Fμσ = - 2 * μδ * σδ * e / (sqrt(M_PI) * h * h * h) + tμσ;
+    double sqrt_π_h5 = sqrt_π_h * sqrt_π_h; sqrt_π_h5 *= sqrt_π_h5; sqrt_π_h5 *= sqrt_π_h;
+    Fσσ = e * (256 + 4 * M_PI * σδ * σδ * (8 + M_PI * μδ * μδ)) / sqrt_π_h5 + tσσ;
 }
 
 // order-0 per-basis-term integrals (for the tie model's CAVI accumulators)
@@ -173,6 +196,9 @@ class Observations {
                 }
             }
         }
+        // canonical tie insertion: always stores in the upper triangle (reads tolerate either)
+        void add_tie(int i, int j) { T(std::min(i, j), std::max(i, j)) += 1; }
+
         // Davidson generator: win/tie/loss with true tie parameter λ
         Observations(int n, const Instance& instance, int count, double λ) : X(n,n), T(n,n) {
             X.reserve(count);
@@ -184,7 +210,7 @@ class Observations {
                 double Z = 2*cosh(d/2) + λ;
                 double r = (double)rand() / (double)RAND_MAX * Z;
                 if (r < exp(d/2)) X(i,j) += 1;
-                else if (r < exp(d/2) + λ) T(std::min(i,j), std::max(i,j)) += 1;
+                else if (r < exp(d/2) + λ) add_tie(i, j);
                 else X(j,i) += 1;
             }
         }
@@ -207,6 +233,8 @@ class Observations {
         }
 };
 
+static const char* TIE_ATOMS_DEFAULT = "fit_results/tie_atoms_J16.txt";
+
 // --- tie model: Davidson tie parameter λ with a categorical variational posterior over J atoms ---
 // Atoms sit at prior quantiles of p0 = λ/(2+λ) (see python/fit_tie_atoms.py), each with prior
 // mass 1/J.  Every atom's bump  b_λ(δ) = log(1 + λ/(2cosh(δ/2)))  is represented in a shared
@@ -223,11 +251,15 @@ struct TieModel {
     double KLwπ = 0;                          // Σ_j w_j log(w_j/π_j): the categorical KL term
 
     static TieModel load(const std::string& path) {
-        TieModel t; std::ifstream f(path);
-        if (!f) {
-            f.open("../" + path);             // allow running the binary from CC/
+        TieModel t;
+        std::string used = path;              // the path actually opened, for honest error messages
+        std::ifstream f(path);
+        if (!f && path == TIE_ATOMS_DEFAULT) {
+            used = "../" + path;              // allow running the binary from CC/ (default file only:
+            f.open(used);                     //  never silently substitute an explicit user path)
             if (!f) throw std::runtime_error("cannot open tie atom file " + path + " (also tried ../)");
         }
+        if (!f) throw std::runtime_error("cannot open tie atom file " + path);
         f >> t.J >> t.L;
         t.a.resize(t.L);
         for (auto& v : t.a) f >> v;
@@ -239,11 +271,16 @@ struct TieModel {
             t.logπ[j] = log(t.π[j]);
             for (int l = 0; l < t.L; l++) f >> t.P[(size_t)j*t.L+l] >> t.Q[(size_t)j*t.L+l];
         }
-        if (!f) throw std::runtime_error("bad tie atom file " + path);
+        if (!f) throw std::runtime_error("bad tie atom file " + used);
         t.w.assign(t.J, 1.0/t.J);
         t.pmix.resize(t.L); t.qmix.resize(t.L);
         t.premix();
         return t;
+    }
+    double E_lambda() const {                 // posterior mean of the tie parameter
+        double E = 0;
+        for (int j = 0; j < J; j++) E += w[j]*λ[j];
+        return E;
     }
     void premix() {
         wlogλ = 0; KLwπ = 0;
@@ -595,27 +632,20 @@ class Ranker {
                     if (count == 0) return;
 
                     const double σδ = sqrt(σ2(i) + σ2(j));
-                    const double h = sqrt(16.0 / M_PI + 2 * σδ * σδ);
-                    const double sqrt_π_h = sqrt(M_PI) * h;
                     const double μδ = μ(i) - μ(j);
-                    const double μδ_over_h = μδ / h;
-                    const double exp_minus_μδ_over_h_square = exp(-μδ_over_h * μδ_over_h);
-                    double Tc, tμ, tσ, tμμ, tμσ, tσσ;
-                    correction(μδ, σδ, compute_gradient ? 2 : 0, Tc, tμ, tσ, tμμ, tμσ, tσσ);
+                    double F, Fμ, Fσ, Fμμ, Fμσ, Fσσ;
+                    F_kernel(μδ, σδ, compute_gradient ? 2 : 0, F, Fμ, Fσ, Fμμ, Fμσ, Fσσ);
                     if (tie_on) {   // premixed atom bumps enter exactly like the correction terms
                         double Bt, bμ, bσ, bμμ, bμσ, bσσ;
                         bump_eval(ties->L, ties->a.data(), ties->pmix.data(), ties->qmix.data(), μδ, σδ,
                                   compute_gradient ? 2 : 0, Bt, bμ, bσ, bμμ, bμσ, bσσ);
-                        Tc += Bt; tμ += bμ; tσ += bσ; tμμ += bμμ; tμσ += bμσ; tσσ += bσσ;
+                        F += Bt; Fμ += bμ; Fσ += bσ; Fμμ += bμμ; Fμσ += bμσ; Fσσ += bσσ;
                     }
-                    const double gμδ = - 0.5 * (1 - erf(μδ_over_h)) + tμ;   // gμδ stores +dF/dμδ
-                    const double gσδ = - exp_minus_μδ_over_h_square * σδ / sqrt_π_h - tσ;  // gσδ stores -dF/dσδ
+                    const double gμδ = Fμ;    // legacy conventions of this loop: gμδ stores +dF/dμδ
+                    const double gσδ = - Fσ;  // gσδ stores -dF/dσδ
                     const double lin = 0.5 * (2.0 * n_l + n_t);             // linear-in-μδ coefficient
 
-                    // F_erf + correction; write F_erf explicitly rather than reuse the augmented gμδ
-                    v += count * (exp_minus_μδ_over_h_square * h / (2 * sqrt(M_PI))
-                                  - 0.5 * μδ * (1 - erf(μδ_over_h)) + Tc)
-                         + lin * μδ - n_t * wlogλ;
+                    v += count * F + lin * μδ - n_t * wlogλ;
 
                     if (compute_gradient) {
                         // dv/dμi, dv/dμj
@@ -629,14 +659,9 @@ class Ranker {
 
                     if (compute_hessian) {
 
-                        //    hμμδ = - exp(-(μδ/h)**2) / (sqrt(π) * h)
-                        //    hμσδ = 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3)
-                        //    hσσδ = - exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + π * μδ**2)) / (π**(5/2) * h**5)
-
-                        const double hμμδ = - exp_minus_μδ_over_h_square / sqrt_π_h - tμμ;
-                        const double hμσδ = 2 * μδ * σδ * exp_minus_μδ_over_h_square / (sqrt(M_PI) * h * h * h) - tμσ;
-                        double sqrt_π_h5 = sqrt_π_h * sqrt_π_h; sqrt_π_h5 *= sqrt_π_h5; sqrt_π_h5 *= sqrt_π_h;
-                        const double hσσδ = - exp_minus_μδ_over_h_square * (256 + 4 * M_PI * σδ * σδ * (8 + M_PI * μδ * μδ)) / sqrt_π_h5 - tσσ;
+                        const double hμμδ = - Fμμ;   // h*δ store the NEGATED second derivatives
+                        const double hμσδ = - Fμσ;   // (legacy convention of this loop)
+                        const double hσσδ = - Fσσ;
 
                         // diagonal hessian terms
                         hessian->diag(i) -= count * hμμδ;
@@ -754,14 +779,17 @@ class Ranker {
 
         void fit(const Observations& obs, const double tol = 1e-8, const int max_iter = 1e6, const bool verbose = false) {
             if (!ties) { newton(obs, tol, max_iter, verbose); return; }
+            const double loose = std::max(tol, 1e-4);     // intermediate rounds need not fully converge
             double dw = 1.0;
             for (int r = 0; r < 8 && dw >= 1e-9; r++) {   // alternate Newton and the exact w-update
-                newton(obs, tol, max_iter, verbose);
+                newton(obs, loose, max_iter, verbose);
                 dw = cavi(obs);
             }
-            // if the cap bound, the weights moved after the last Newton pass: refit the scores so
-            // the returned parameters (and cached val/gradient/hessian) match the stored weights
-            if (dw >= 1e-9) newton(obs, tol, max_iter, verbose);
+            if (dw >= 1e-9)
+                std::cerr << "warning: tie-weight alternation hit its 8-round cap without stationarity\n";
+            // always end on a full-tolerance Newton pass, so the returned parameters (and cached
+            // val/gradient/hessian) correspond to the stored weights
+            newton(obs, tol, max_iter, verbose);
         }
 };
 
@@ -828,12 +856,10 @@ static void compute_dobs(const std::vector<double>& mu, const std::vector<double
     for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) {
         double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
         double md = mu[i] - mu[j];
-        double h = sqrt(16.0 / M_PI + 2.0 * sd * sd);
-        double T, tμ, tσ, tμμ, tμσ, tσσ; correction(md, sd, 1, T, tμ, tσ, tμμ, tμσ, tσσ);
-        double gmd = -0.5 * (1.0 - std::erf(md / h)) + tμ;
-        double gsd = -exp(-(md / h) * (md / h)) * sd / (sqrt(M_PI) * h) - tσ;
-        d0[i * n + j] = -gsd / sd;
-        d1[i * n + j] = gmd;
+        double F, Fμ, Fσ, Fμμ, Fμσ, Fσσ;
+        F_kernel(md, sd, 1, F, Fμ, Fσ, Fμμ, Fμσ, Fσσ);
+        d0[i * n + j] = Fσ / sd;
+        d1[i * n + j] = Fμ;
     }
 }
 
@@ -870,13 +896,12 @@ static void build_Hlin(const std::vector<double>& mu, const std::vector<double>&
             double count = *el;
             double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
             double md = mu[i] - mu[j];
-            double h = sqrt(16.0 / M_PI + 2.0 * sd * sd);
-            double e = exp(-(md / h) * (md / h));
-            double Tc, tμ, tσ, tμμ, tμσ, tσσ; correction(md, sd, 2, Tc, tμ, tσ, tμμ, tμσ, tσσ);
-            double gsd = -e * sd / (sqrt(M_PI) * h) - tσ;
-            double hmm = -e / (sqrt(M_PI) * h) - tμμ;
-            double hms = 2.0 * md * sd * e / (sqrt(M_PI) * h * h * h) - tμσ;
-            double hss = -e * (256.0 + 4.0 * M_PI * sd * sd * (8.0 + M_PI * md * md)) / (pow(M_PI, 2.5) * pow(h, 5)) - tσσ;
+            double F, Fμ, Fσ, Fμμ, Fμσ, Fσσ;
+            F_kernel(md, sd, 2, F, Fμ, Fσ, Fμμ, Fμσ, Fσσ);
+            double gsd = -Fσ;
+            double hmm = -Fμμ;
+            double hms = -Fμσ;
+            double hss = -Fσσ;
             // diagonal (subtracted)
             A(i, i)         -= count * hmm;
             A(j, j)         -= count * hmm;
@@ -1027,12 +1052,12 @@ static std::pair<int,int> select_logdomain(Ranker& rk, const Observations& obs, 
     for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
         double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
         double md = mu[i] - mu[j];
-        double h = sqrt(16.0 / M_PI + 2.0 * sd * sd);
-        double T, tμ, tσ, tμμ, tμσ, tσσ; correction(md, sd, 1, T, tμ, tσ, tμμ, tμσ, tσσ);   // win uses μδ=md
-        double Tl, tμl, tσl, a3, a4, a5; correction(-md, sd, 1, Tl, tμl, tσl, a3, a4, a5);   // lose uses μδ=-md
-        double gmd  = -0.5 * (1.0 - std::erf(md / h)) + tμ;    // win: i beats j
-        double gmd2 = -0.5 * (1.0 - std::erf(-md / h)) + tμl;  // lose: j beats i
-        double gsd  = -exp(-(md / h) * (md / h)) * sd / (sqrt(M_PI) * h) - tσ;  // tσ even in md
+        double Fw, Fμw, Fσw, u3, u4, u5, Fl, Fμl, Fσl;
+        F_kernel(md, sd, 1, Fw, Fμw, Fσw, u3, u4, u5);    // win uses μδ=md
+        F_kernel(-md, sd, 1, Fl, Fμl, Fσl, u3, u4, u5);   // lose uses μδ=-md
+        double gmd  = Fμw;    // win: i beats j
+        double gmd2 = Fμl;    // lose: j beats i
+        double gsd  = -Fσw;   // Fσ even in md
         double sig_part = -(gsd / sd) * (factor(n + i) * sg[i] * sg[i] + factor(n + j) * sg[j] * sg[j]);
         double ifwin  = (factor(i) - factor(j)) * gmd  + sig_part;
         double iflose = (factor(j) - factor(i)) * gmd2 + sig_part;
@@ -1129,7 +1154,6 @@ static int verify() {
 }
 
 // ----- verify3: tie-model checks -- FD gradients (with and without ties), fit, reference values -----
-static const char* TIE_ATOMS_DEFAULT = "fit_results/tie_atoms_J16.txt";
 static int verify3(const std::string& atomfile) {
     int n = 6;
     Observations obs(n);
@@ -1158,12 +1182,13 @@ static int verify3(const std::string& atomfile) {
         double v0 = *rk.val;
         ublas::vector<double> g0 = *rk.gradient;
         double h = 1e-6, maxerr = 0;
+        Ranker rp(n, p), rm(n, p);                 // constructed once; only params(k) varies
+        rp.ties = rk.ties; rm.ties = rk.ties;
         for (int k = 0; k < 2 * n + 2; k++) {
-            Ranker rp(n, p), rm(n, p);
-            rp.params(k) += h; rm.params(k) -= h;
-            rp.ties = rk.ties; rm.ties = rk.ties;
+            rp.params(k) = p(k) + h; rm.params(k) = p(k) - h;
             rp.evaluate(obs); rm.evaluate(obs);
             maxerr = std::max(maxerr, std::fabs((*rp.val - *rm.val) / (2 * h) - g0(k)));
+            rp.params(k) = p(k); rm.params(k) = p(k);
         }
         std::cout << (tie_on ? "ties   " : "no-ties") << ": val=" << v0 << "  FD grad max err=" << std::scientific << maxerr << std::fixed << "\n";
     }
@@ -1171,7 +1196,7 @@ static int verify3(const std::string& atomfile) {
     Ranker rk(n, p);
     rk.ties = TieModel::load(atomfile);
     rk.fit(obs);
-    double Eλ = 0; for (int j = 0; j < rk.ties->J; j++) Eλ += rk.ties->w[j] * rk.ties->λ[j];
+    double Eλ = rk.ties->E_lambda();
     std::vector<double> mu(n), sg(n);
     for (int i = 0; i < n; i++) { mu[i] = rk.params(i); sg[i] = exp(rk.params(n + i)); }
     std::cout << "fitted: val=" << *rk.val << "  E[λ]=" << Eλ << "\nmu=";
@@ -1190,7 +1215,7 @@ static int tiebench(const std::string& atomfile, int nb, int count, double λtru
     auto t0 = std::chrono::high_resolution_clock::now();
     ranker.fit(obs, 1e-8, 1e6, false);
     auto t1 = std::chrono::high_resolution_clock::now();
-    double Eλ = 0; for (int j = 0; j < ranker.ties->J; j++) Eλ += ranker.ties->w[j] * ranker.ties->λ[j];
+    double Eλ = ranker.ties->E_lambda();
     std::vector<double> mu(nb), z(nb);
     for (int i = 0; i < nb; i++) { mu[i] = ranker.params(i); z[i] = inst.z(i); }
     std::cout << "n=" << nb << " comparisons=" << count << " λ*=" << λtrue
