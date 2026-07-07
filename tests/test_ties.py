@@ -7,16 +7,22 @@ sample loops) rather than hypothesis, so failures are deterministic and reproduc
 
 Run from the repository root:  pytest tests/test_ties.py
 """
+import functools
 import os
+import shutil
 import sys
 import hashlib
 import subprocess
+import tempfile
 import warnings
 
 import numpy as np
 import pytest
 from scipy.integrate import quad
 from scipy.sparse import coo_matrix
+from scipy.special import erf
+from scipy.stats import invgamma
+from scipy.stats import norm as norm_dist
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "python")))
 import models  # noqa: E402
@@ -35,9 +41,16 @@ P0 = np.concatenate([[0.30, -0.50, 0.10, 0.80, -0.20, 0.40],
 # Bit-exact references for the no-ties evaluation of the fixture (val as IEEE hex; SHA-256 of the
 # concatenated val/gradient/h_diag/h_obs bytes).  These freeze the kernel arithmetic: any change
 # to the erf approximation, the correction, or the summation order trips them and must be a
-# conscious re-baselining.
+# conscious re-baselining.  To re-baseline, evaluate the fixture and record
+#     float(gh.val).hex()   and   hashlib.sha256(blob).hexdigest()
+# where blob = np.concatenate([[gh.val], gh.g, gh.h_diag, gh.h_obs.data]).tobytes().
+# The freeze only makes sense on the reference libm/numpy: a canary detects other platforms
+# (macOS/musl/FMA differ by ulps) and skips the bit assertions there -- the value-level and
+# quadrature tests below still cover the kernel everywhere.
 NOTIES_VAL_HEX = "0x1.f804cbfb3ac55p+3"          # 15.75058555...
 NOTIES_BLOB_SHA = "eb5a99ee44e186336d947b4d4aec38b36cc39d1ce47d92032ba283174853152f"
+REF_LIBM = (float(erf(0.7)).hex() == "0x1.5b08c21171645p-1"
+            and float(np.exp(-0.49)).hex() == "0x1.39aa2aaf607f6p-1")
 # Value references at print precision (shared with CC/ranker verify3's output)
 TIES_VAL = 35.22469640          # fixture eval with the non-uniform w below
 FITTED_VAL = 25.49414535        # fixture after fit
@@ -85,6 +98,12 @@ def gauss_quad(f, m, s):
 # Kernel regression: bit-exact freeze of the no-ties evaluation
 # ---------------------------------------------------------------------------------------------
 class TestKernelFreeze:
+    def test_noties_eval_value(self):
+        """Value-level check that runs on every platform."""
+        vb = fixture_vb()
+        assert vb.eval(wins_coo()).val == pytest.approx(15.75058555, abs=5e-8)
+
+    @pytest.mark.skipif(not REF_LIBM, reason="non-reference libm: bit-exact freeze not applicable")
     def test_noties_eval_bit_exact(self):
         vb = fixture_vb()
         gh = vb.eval(wins_coo(), compute_gradient=True, compute_hessian=True)
@@ -100,9 +119,34 @@ class TestKernelFreeze:
         vb = fixture_vb(enable_ties=True)
         vb.fit(wins_coo(), tie_obs=ties_coo(), verbose=False)
         assert vb.eval(wins_coo(), tie_obs=ties_coo()).val == pytest.approx(FITTED_VAL, abs=1e-6)
-        assert vb.ties.E_λ() == pytest.approx(FITTED_ELAM, abs=1e-6)
+        # E[lambda] gets a looser tolerance: lambda is weakly identified, so the val stopping rule
+        # amplifies along the flat direction (different libm/BLAS shift it more than val)
+        assert vb.ties.E_λ() == pytest.approx(FITTED_ELAM, abs=1e-5)
         # certification: the returned weights are CAVI-stationary for the returned scores
-        assert vb.cavi(wins_coo(), ties_coo()) < 1e-9
+        assert vb.cavi(wins_coo(), ties_coo()) < models.W_STAT
+
+    def test_prior_terms_match_independent_quadrature(self):
+        """With no observations, val is exactly the entropy + prior cross-entropy part of the
+        KL.  Recompute it from scipy primitives alone (no models.py algebra): this is the one
+        check that would catch a wrong coefficient in the alpha/beta prior terms, which FD (self-
+        consistent), the bit freeze (freezes whatever is computed), and the cross-implementation
+        comparison (shared derivation) all miss."""
+        vb = fixture_vb()
+        val = vb.eval(coo_matrix((N, N))).val
+        α, β = 1.5, 2.5
+        Mα, Mβ = 1.2, 2.0
+        σ, μ = P0[N:2 * N], P0[:N]
+        q = invgamma(α, scale=1 / β)
+        # - entropies of the variational factors
+        indep = -q.entropy() - sum(norm_dist.entropy(scale=s) for s in σ)
+        # - E_q[log p(v)] for the InvGamma prior, by quadrature
+        p = invgamma(Mα, scale=1 / Mβ)
+        indep += quad(lambda v: -q.pdf(v) * p.logpdf(v), 0, np.inf, limit=300)[0]
+        # - E_q(v) E_q(z)[ -log N(z; 0, sqrt(v)) ], inner expectation in closed form, v by quadrature
+        m2s2 = float(np.sum(μ ** 2 + σ ** 2))
+        indep += quad(lambda v: q.pdf(v) * (N / 2 * np.log(2 * np.pi * v) + m2s2 / (2 * v)),
+                      0, np.inf, limit=300)[0]
+        assert val == pytest.approx(indep, abs=1e-8)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -188,18 +232,46 @@ class TestDerivatives:
         gh = vb.eval(wins_coo(), compute_gradient=True, compute_hessian=True, tie_obs=tobs)
         H = np.array([gh.hdot(col) for col in np.eye(2 * N + 2)])
         h = 1e-6
+
+        def eval_at(k, sgn):
+            vb.params = P0.copy()
+            vb.params[k] += sgn * h
+            g = vb.eval(wins_coo(), compute_gradient=True, tie_obs=tobs)
+            return g.val, g.g.copy()
+
         for k in range(2 * N + 2):
-            for sgn, store in ((+1, "p"), (-1, "m")):
-                vb.params = P0.copy()
-                vb.params[k] += sgn * h
-                g = vb.eval(wins_coo(), compute_gradient=True, tie_obs=tobs)
-                if store == "p":
-                    vp, gp = g.val, g.g.copy()
-                else:
-                    vm, gm = g.val, g.g.copy()
+            vp, gp = eval_at(k, +1)
+            vm, gm = eval_at(k, -1)
             vb.params = P0.copy()
             assert (vp - vm) / (2 * h) == pytest.approx(gh.g[k], abs=1e-6)
             np.testing.assert_allclose((gp - gm) / (2 * h), H[k], atol=1e-6)
+
+    def test_gradient_fd_random_regimes(self):
+        """FD sweep over random parameter regimes: well-separated means (erf saturation), tiny
+        and large sigmas, off-prior alpha/beta -- territory the mild fixture never reaches."""
+        rng = np.random.default_rng(21)
+        n, h = 5, 1e-6
+        for trial in range(10):
+            with_ties = trial % 2 == 1
+            vb = models.VBayes(models.Model(n=n))
+            params = np.concatenate([rng.normal(0, 2.5, n), rng.uniform(0.05, 3, n),
+                                     [rng.uniform(0.5, 4), rng.uniform(0.5, 5)]])
+            vb.params = params.copy()
+            X = rng.integers(0, 4, (n, n))
+            np.fill_diagonal(X, 0)
+            obs = coo_matrix(X)
+            tobs = None
+            if with_ties:
+                vb.enable_ties()
+                tobs = coo_matrix(np.triu(rng.integers(0, 3, (n, n)), 1))
+            gh = vb.eval(obs, compute_gradient=True, tie_obs=tobs)
+            for k in range(2 * n + 2):
+                vb.params = params.copy(); vb.params[k] += h
+                fp = vb.eval(obs, tie_obs=tobs).val
+                vb.params = params.copy(); vb.params[k] -= h
+                fm = vb.eval(obs, tie_obs=tobs).val
+                vb.params = params.copy()
+                assert (fp - fm) / (2 * h) == pytest.approx(gh.g[k], rel=2e-4, abs=5e-6)
 
     def test_dobs_matches_per_direction_kernel(self):
         vb = fixture_vb()
@@ -299,18 +371,22 @@ class TestInputHandling:
             vb.KL(wins_coo())
 
     def test_ties_off_warning(self):
-        vb = fixture_vb()
-        with warnings.catch_warnings(record=True) as wl:
-            warnings.simplefilter("always")
-            vb.fit(wins_coo(), tie_obs=ties_coo(), verbose=False)
+        def fit_recording_warnings(vb, tie_obs):
+            with warnings.catch_warnings(record=True) as wl:
+                warnings.simplefilter("always")
+                # re-arm the module's RuntimeWarning->error promotion: newton's overflow
+                # backoff depends on it, and simplefilter("always") just cleared it
+                warnings.filterwarnings("error", category=RuntimeWarning)
+                vb.fit(wins_coo(), tie_obs=tie_obs, verbose=False)
+            return wl
+
+        wl = fit_recording_warnings(fixture_vb(), ties_coo())
         assert any("IGNORED" in str(w.message) for w in wl)
-        # ... but a tie matrix of stored explicit zeros must NOT warn
+        # ... but a tie matrix of stored explicit zeros must NOT warn (assert the SPECIFIC
+        # message's absence: unrelated future DeprecationWarnings must not break this test)
         tz = coo_matrix((np.zeros(3), ([0, 1, 2], [1, 2, 3])), shape=(N, N))
-        vb2 = fixture_vb()
-        with warnings.catch_warnings(record=True) as wl:
-            warnings.simplefilter("always")
-            vb2.fit(wins_coo(), tie_obs=tz, verbose=False)
-        assert not wl
+        wl = fit_recording_warnings(fixture_vb(), tz)
+        assert not any("IGNORED" in str(w.message) for w in wl)
 
     def test_empty_tie_matrix_is_valid(self):
         """No ties observed is legitimate data: the posterior should favor small lambda."""
@@ -340,7 +416,7 @@ class TestEndToEnd:
         vb.fit(w12, tie_obs=t12, verbose=False)
         assert 0.4 < vb.ties.E_λ() < 1.4           # lambda is weakly identified; loose bounds
         assert vb.actual_inversions(inst) <= 12    # ranking is well recovered
-        assert vb.cavi(w12, t12) < 1e-9            # returned state is certified stationary
+        assert vb.cavi(w12, t12) < models.W_STAT   # returned state is certified stationary
 
     def test_no_ties_fit_unaffected(self):
         models.rng = np.random.default_rng(12)
@@ -356,25 +432,36 @@ class TestEndToEnd:
 # ---------------------------------------------------------------------------------------------
 # Cross-implementation agreement with CC/ranker (skipped when no binary and no compiler)
 # ---------------------------------------------------------------------------------------------
+@functools.lru_cache(maxsize=None)
 def _ranker_binary():
+    """The CC/ranker binary to cross-check against, or None if unavailable.
+    Lazy (called from inside the test, never at collection time) and staleness-aware: the
+    project's own binary is used only if it is newer than ranker.cc; otherwise a fresh test
+    binary is built into a scratch path (NOT CC/ranker, so a -O2 test build never shadows the
+    user's -O3 benchmark binary)."""
+    src = os.path.join(REPO, "CC", "ranker.cc")
     exe = os.path.join(REPO, "CC", "ranker")
-    if os.path.exists(exe):
+    if os.path.exists(exe) and os.path.getmtime(exe) >= os.path.getmtime(src):
         return exe
-    import shutil
-    if shutil.which("g++"):
+    if not shutil.which("g++"):
+        return None
+    scratch = os.path.join(tempfile.gettempdir(),
+                           f"ranker_test_{hashlib.sha256(open(src, 'rb').read()).hexdigest()[:16]}")
+    if not os.path.exists(scratch):
         try:
-            subprocess.run(["g++", "-O2", "-std=gnu++17", os.path.join(REPO, "CC", "ranker.cc"),
-                            "-o", exe, "-pthread"], check=True, capture_output=True, timeout=300)
-            return exe
+            subprocess.run(["g++", "-O2", "-std=gnu++17", src, "-o", scratch, "-pthread"],
+                           check=True, capture_output=True, timeout=300)
         except Exception:
             return None
-    return None
+    return scratch
 
 
-@pytest.mark.skipif(_ranker_binary() is None, reason="CC/ranker binary unavailable and g++ absent")
 class TestCrossImplementation:
     def test_verify3_values_match(self):
-        out = subprocess.run([_ranker_binary(), "verify3"], cwd=REPO, capture_output=True,
+        exe = _ranker_binary()
+        if exe is None:
+            pytest.skip("CC/ranker binary unavailable and g++ absent")
+        out = subprocess.run([exe, "verify3"], cwd=REPO, capture_output=True,
                              text=True, timeout=300).stdout
         cpp_noties = float(out.split("no-ties: val=")[1].split()[0])
         cpp_ties = float(out.split("ties   : val=")[1].split()[0])
@@ -388,4 +475,4 @@ class TestCrossImplementation:
         vb = fixture_vb(enable_ties=True)
         vb.fit(wins_coo(), tie_obs=ties_coo(), verbose=False)
         assert vb.eval(wins_coo(), tie_obs=ties_coo()).val == pytest.approx(cpp_fitted, abs=1e-6)
-        assert vb.ties.E_λ() == pytest.approx(cpp_elam, abs=1e-6)
+        assert vb.ties.E_λ() == pytest.approx(cpp_elam, abs=1e-5)   # weakly identified: loose

@@ -36,6 +36,10 @@ def almost_log_expit(x):
 CORR_A = array([0.04802229968, 0.08966847198, 0.1575268951, 0.252698338, 0.4630803829])
 CORR_C = array([0.0007259888421, 0.00854921256, 0.02779792245, 0.017919263, 0.001535080506])
 
+# Tie-weight stationarity threshold (max |Δw|) used by fit()'s alternation, its warnings, and the
+# certification tests; mirrored by the C++ fit()'s local W_STAT -- change both together.
+W_STAT = 1e-9
+
 def bump_eval(A, P, Q, μδ, σδ, order=2):
     """Gaussian integral of  Σ_k (p_k + q_k a_k z²) e^{-a_k z²}  against N(μδ, σδ²), with plain
     derivatives wrt (μδ, σδ):  returns (T, dT/dμδ, dT/dσδ, d²T/dμδ², d²T/dμδdσδ, d²T/dσδ²).
@@ -815,7 +819,6 @@ class VBayes():
             def step(t):
                 self.newton(obs, tol=t, max_iter=max_iter, verbose=verbose, λ0=λ0, λmax=λmax,
                             tie_obs=tie_obs, pairs=pairs)
-            W_STAT = 1e-9                             # weight-stationarity threshold (max |Δw|)
             loose = max(sqrt(tol), 1e-4)              # intermediate rounds need not fully converge
             for _ in range(8):
                 step(loose)

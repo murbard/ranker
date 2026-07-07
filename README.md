@@ -12,3 +12,8 @@ finding items close to each other with large distributions.
 
 It would be worth considering comparing this fancy stuff to the heuristic:
 "pick the two items with the most distribution overlap and compare them"
+
+Ties: the Davidson tie model (see the paper's "Extension: comparisons with ties") is implemented
+in both CC/ranker.cc and python/models.py; tie-aware *active selection* lives in the C++ side
+only (`select_eig_ties`) — the Python `best_pair` and `KL` raise `NotImplementedError` when the
+tie model is enabled.
