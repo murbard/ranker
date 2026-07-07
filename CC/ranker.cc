@@ -68,16 +68,19 @@ inline void bump_eval(int K, const double* A, const double* P_, const double* Q_
         double D = 1 + 2*a*s, E = exp(-a*μ*μ/D), P = E/sqrt(D);
         double B = p + q*(a*μ*μ/(D*D) + a*s/D);
         double Pμ = P*(-2*a*μ/D), R = -a/D + 2*a*a*μ*μ/(D*D), Ps = P*R;
-        double Pμμ = P*(4*a*a*μ*μ/(D*D) - 2*a/D), Rs = 2*a*a/(D*D) - 8*a*a*a*μ*μ/(D*D*D), Pss = P*(R*R + Rs);
-        double Pμs = Ps*(-2*a*μ/D) + P*4*a*a*μ/(D*D);
-        double Bμ = q*2*a*μ/(D*D), Bs = q*(a/(D*D) - 4*a*a*μ*μ/(D*D*D)), Bμμ = q*2*a/(D*D);
-        double Bμs = q*(-8*a*a*μ/(D*D*D)), Bss = q*(-4*a*a/(D*D*D) + 24*a*a*a*μ*μ/(D*D*D*D));
+        double Bμ = q*2*a*μ/(D*D), Bs = q*(a/(D*D) - 4*a*a*μ*μ/(D*D*D));
         T   += P*B;
         Tμ  += Pμ*B + P*Bμ;
         Ts  += Ps*B + P*Bs;
-        Tμμ += Pμμ*B + 2*Pμ*Bμ + P*Bμμ;
-        Tμs += Pμs*B + Pμ*Bs + Ps*Bμ + P*Bμs;
-        Tss += Pss*B + 2*Ps*Bs + P*Bss;
+        if (order >= 2) {   // order 1 = first derivatives only (dobs / selection paths)
+            double Pμμ = P*(4*a*a*μ*μ/(D*D) - 2*a/D), Rs = 2*a*a/(D*D) - 8*a*a*a*μ*μ/(D*D*D), Pss = P*(R*R + Rs);
+            double Pμs = Ps*(-2*a*μ/D) + P*4*a*a*μ/(D*D);
+            double Bμμ = q*2*a/(D*D);
+            double Bμs = q*(-8*a*a*μ/(D*D*D)), Bss = q*(-4*a*a/(D*D*D) + 24*a*a*a*μ*μ/(D*D*D*D));
+            Tμμ += Pμμ*B + 2*Pμ*Bμ + P*Bμμ;
+            Tμs += Pμs*B + Pμ*Bs + Ps*Bμ + P*Bμs;
+            Tss += Pss*B + 2*Ps*Bs + P*Bss;
+        }
     }
     tμ = Tμ; tσ = Ts*2*σδ; tμμ = Tμμ; tμσ = Tμs*2*σδ; tσσ = 4*s*Tss + 2*Ts;
 }
@@ -92,7 +95,8 @@ inline void correction(double μδ, double σδ, int order,
 // F(μδ, σδ) = ∫ N(μδ, σδ²) log(1+e^{-δ}) dδ --- the error-function approximation plus the k-term
 // correction --- with PLAIN derivatives.  Single source of truth for the observation kernel,
 // consumed by evaluate(), compute_dobs(), build_Hlin() and select_logdomain() (which negate where
-// their legacy conventions store -dF/dσδ and -d²F).  order==0 fills only F.
+// their legacy conventions store -dF/dσδ and -d²F).  order==0 fills only F; order==1 also the
+// first derivatives (second derivatives zero); order>=2 fills everything.
 inline void F_kernel(double μδ, double σδ, int order,
                      double& F, double& Fμ, double& Fσ, double& Fμμ, double& Fμσ, double& Fσσ) {
     const double h = sqrt(16.0 / M_PI + 2 * σδ * σδ);
@@ -105,20 +109,38 @@ inline void F_kernel(double μδ, double σδ, int order,
     if (order == 0) { Fμ = Fσ = Fμμ = Fμσ = Fσσ = 0.0; return; }
     Fμ = - 0.5 * (1 - erf(μδ_over_h)) + tμ;
     Fσ = e * σδ / sqrt_π_h + tσ;
+    if (order < 2) { Fμμ = Fμσ = Fσσ = 0.0; return; }   // order 1: first derivatives only
     Fμμ = e / sqrt_π_h + tμμ;
     Fμσ = - 2 * μδ * σδ * e / (sqrt(M_PI) * h * h * h) + tμσ;
     double sqrt_π_h5 = sqrt_π_h * sqrt_π_h; sqrt_π_h5 *= sqrt_π_h5; sqrt_π_h5 *= sqrt_π_h;
     Fσσ = e * (256 + 4 * M_PI * σδ * σδ * (8 + M_PI * μδ * μδ)) / sqrt_π_h5 + tσσ;
 }
 
-// order-0 per-basis-term integrals (for the tie model's CAVI accumulators)
-inline void basis_phi(int K, const double* A, double μδ, double σδ, double* φp, double* φq) {
-    double s = σδ*σδ, μ = μδ;
+// order-0 per-basis-term integrals (for the tie model's CAVI accumulators).
+// NOTE: takes the VARIANCE σδ² (matching python's basis_phi), not the standard deviation.
+inline void basis_phi(int K, const double* A, double μδ, double σδ2, double* φp, double* φq) {
+    double μ = μδ;
     for (int k = 0; k < K; k++) {
-        double a = A[k], D = 1 + 2*a*s, E = exp(-a*μ*μ/D)/sqrt(D);
+        double a = A[k], D = 1 + 2*a*σδ2, E = exp(-a*μ*μ/D)/sqrt(D);
         φp[k] = E;
-        φq[k] = E*(a*μ*μ/(D*D) + a*s/D);
+        φq[k] = E*(a*μ*μ/(D*D) + a*σδ2/D);
     }
+}
+
+// Gradient kernel at BOTH ±μδ from a single evaluation, exploiting parity: erf and the
+// correction's Tμ are odd in μδ, the Gaussian factor and Fσ are even.  Used by the acquisition
+// loop, which needs the win (μδ) and lose (−μδ) first derivatives for every candidate pair.
+inline void F_kernel_pair(double μδ, double σδ, double& Fμw, double& Fμl, double& Fσ) {
+    const double h = sqrt(16.0 / M_PI + 2 * σδ * σδ);
+    const double sqrt_π_h = sqrt(M_PI) * h;
+    const double μδ_over_h = μδ / h;
+    const double e = exp(-μδ_over_h * μδ_over_h);
+    const double er = erf(μδ_over_h);
+    double Tc, tμ, tσ, tμμ, tμσ, tσσ;
+    correction(μδ, σδ, 1, Tc, tμ, tσ, tμμ, tμσ, tσσ);
+    Fμw = - 0.5 * (1 - er) + tμ;
+    Fμl = - 0.5 * (1 + er) - tμ;
+    Fσ  = e * σδ / sqrt_π_h + tσ;
 }
 
 // boost variate generator
@@ -753,9 +775,9 @@ class Ranker {
                 const int count = n_w + n_l + n_t;
                 if (count == 0) return;
                 nt_tot += n_t;
-                const double σδ = sqrt(s2c[a] + s2c[b]);
+                const double σδ2 = s2c[a] + s2c[b];        // basis_phi takes the variance directly
                 const double μδ = params(a) - params(b);
-                basis_phi(L, t.a.data(), μδ, σδ, φp.data(), φq.data());
+                basis_phi(L, t.a.data(), μδ, σδ2, φp.data(), φq.data());
                 for (int l = 0; l < L; l++) { accp[l] += count*φp[l]; accq[l] += count*φq[l]; }
             });
             std::vector<double> vj(J);
@@ -779,7 +801,7 @@ class Ranker {
 
         void fit(const Observations& obs, const double tol = 1e-8, const int max_iter = 1e6, const bool verbose = false) {
             if (!ties) { newton(obs, tol, max_iter, verbose); return; }
-            const double loose = std::max(tol, 1e-4);     // intermediate rounds need not fully converge
+            const double loose = std::max(tol, sqrt(tol)); // intermediate rounds need not fully converge
             double dw = 1.0;
             for (int r = 0; r < 8 && dw >= 1e-9; r++) {   // alternate Newton and the exact w-update
                 newton(obs, loose, max_iter, verbose);
@@ -788,8 +810,12 @@ class Ranker {
             if (dw >= 1e-9)
                 std::cerr << "warning: tie-weight alternation hit its 8-round cap without stationarity\n";
             // always end on a full-tolerance Newton pass, so the returned parameters (and cached
-            // val/gradient/hessian) correspond to the stored weights
+            // val/gradient/hessian) correspond to the stored weights ...
             newton(obs, tol, max_iter, verbose);
+            for (int r = 0; r < 2; r++) {                 // ... and re-certify weight stationarity
+                if (cavi(obs) < 1e-9) break;              //     against the FULL-tolerance scores
+                newton(obs, tol, max_iter, verbose);
+            }
         }
 };
 
@@ -1052,12 +1078,11 @@ static std::pair<int,int> select_logdomain(Ranker& rk, const Observations& obs, 
     for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
         double sd = sqrt(sg[i] * sg[i] + sg[j] * sg[j]);
         double md = mu[i] - mu[j];
-        double Fw, Fμw, Fσw, u3, u4, u5, Fl, Fμl, Fσl;
-        F_kernel(md, sd, 1, Fw, Fμw, Fσw, u3, u4, u5);    // win uses μδ=md
-        F_kernel(-md, sd, 1, Fl, Fμl, Fσl, u3, u4, u5);   // lose uses μδ=-md
+        double Fμw, Fμl, Fσ;
+        F_kernel_pair(md, sd, Fμw, Fμl, Fσ);   // one kernel gives both ±md gradients (parity)
         double gmd  = Fμw;    // win: i beats j
         double gmd2 = Fμl;    // lose: j beats i
-        double gsd  = -Fσw;   // Fσ even in md
+        double gsd  = -Fσ;    // Fσ even in md
         double sig_part = -(gsd / sd) * (factor(n + i) * sg[i] * sg[i] + factor(n + j) * sg[j] * sg[j]);
         double ifwin  = (factor(i) - factor(j)) * gmd  + sig_part;
         double iflose = (factor(j) - factor(i)) * gmd2 + sig_part;
@@ -1190,7 +1215,19 @@ static int verify3(const std::string& atomfile) {
             maxerr = std::max(maxerr, std::fabs((*rp.val - *rm.val) / (2 * h) - g0(k)));
             rp.params(k) = p(k); rm.params(k) = p(k);
         }
-        std::cout << (tie_on ? "ties   " : "no-ties") << ": val=" << v0 << "  FD grad max err=" << std::scientific << maxerr << std::fixed << "\n";
+        // Hessian against central differences of the gradient
+        rk.evaluate(obs, true, true);
+        auto Hd = rk.hessian->toDense();
+        double hmaxerr = 0;
+        for (int k = 0; k < 2 * n + 2; k++) {
+            rp.params(k) = p(k) + h; rm.params(k) = p(k) - h;
+            rp.evaluate(obs, true, false); rm.evaluate(obs, true, false);
+            for (int l = 0; l < 2 * n + 2; l++)
+                hmaxerr = std::max(hmaxerr, std::fabs(((*rp.gradient)(l) - (*rm.gradient)(l)) / (2 * h) - Hd(l, k)));
+            rp.params(k) = p(k); rm.params(k) = p(k);
+        }
+        std::cout << (tie_on ? "ties   " : "no-ties") << ": val=" << v0 << "  FD grad max err=" << std::scientific << maxerr
+                  << "  FD hess max err=" << hmaxerr << std::fixed << "\n";
     }
     // fit with ties and report the tie posterior
     Ranker rk(n, p);
@@ -1280,10 +1317,7 @@ int main(int argc, char ** argv) {
         int count = argc > 3 ? atoi(argv[3]) : 160000;
         Instance inst = Instance::random(nb);
         Observations obs(nb, inst, count);
-        ublas::vector<double> params(2 * nb + 2);
-        for (int i = 0; i < nb; i++) { params(i) = 0.0; params(nb + i) = 0.0; }  // mu=0, ln sigma=0
-        params(2 * nb) = log(1.2); params(2 * nb + 1) = log(2.0);                  // ln alpha, ln beta
-        Ranker ranker(nb, params);
+        Ranker ranker(nb, init_params(nb));   // same cold start as verify2/tiebench/run_once
         auto t0 = std::chrono::high_resolution_clock::now();
         ranker.fit(obs, 1e-8, 1e6, false);
         auto t1 = std::chrono::high_resolution_clock::now();

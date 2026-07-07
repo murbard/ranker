@@ -40,7 +40,8 @@ def bump_eval(A, P, Q, μδ, σδ, order=2):
     """Gaussian integral of  Σ_k (p_k + q_k a_k z²) e^{-a_k z²}  against N(μδ, σδ²), with plain
     derivatives wrt (μδ, σδ):  returns (T, dT/dμδ, dT/dσδ, d²T/dμδ², d²T/dμδdσδ, d²T/dσδ²).
     The erf-approximation correction is the special case p=q=c; the tie model's premixed atom
-    bumps use general (p, q).  order=0 returns only T (derivatives 0)."""
+    bumps use general (p, q).  order=0 returns only T; order=1 additionally the first
+    derivatives (second derivatives zero); order>=2 fills everything."""
     s = σδ * σδ; μ = μδ
     if order == 0:
         T = 0.0
@@ -53,16 +54,18 @@ def bump_eval(A, P, Q, μδ, σδ, order=2):
         D = 1 + 2*a*s; E = exp(-a*μ*μ/D); Pk = E/sqrt(D)
         B = p + q*(a*μ*μ/(D*D) + a*s/D)
         Pμ = Pk*(-2*a*μ/D); R = -a/D + 2*a*a*μ*μ/(D*D); Ps = Pk*R
-        Pμμ = Pk*(4*a*a*μ*μ/(D*D) - 2*a/D); Rs = 2*a*a/(D*D) - 8*a**3*μ*μ/(D**3); Pss = Pk*(R*R + Rs)
-        Pμs = Ps*(-2*a*μ/D) + Pk*4*a*a*μ/(D*D)
-        Bμ = q*2*a*μ/(D*D); Bs = q*(a/(D*D) - 4*a*a*μ*μ/(D**3)); Bμμ = q*2*a/(D*D)
-        Bμs = q*(-8*a*a*μ/(D**3)); Bss = q*(-4*a*a/(D**3) + 24*a**3*μ*μ/(D**4))
+        Bμ = q*2*a*μ/(D*D); Bs = q*(a/(D*D) - 4*a*a*μ*μ/(D**3))
         T += Pk*B
         Tμ += Pμ*B + Pk*Bμ
         Ts += Ps*B + Pk*Bs
-        Tμμ += Pμμ*B + 2*Pμ*Bμ + Pk*Bμμ
-        Tμs += Pμs*B + Pμ*Bs + Ps*Bμ + Pk*Bμs
-        Tss += Pss*B + 2*Ps*Bs + Pk*Bss
+        if order >= 2:
+            Pμμ = Pk*(4*a*a*μ*μ/(D*D) - 2*a/D); Rs = 2*a*a/(D*D) - 8*a**3*μ*μ/(D**3); Pss = Pk*(R*R + Rs)
+            Pμs = Ps*(-2*a*μ/D) + Pk*4*a*a*μ/(D*D)
+            Bμμ = q*2*a/(D*D)
+            Bμs = q*(-8*a*a*μ/(D**3)); Bss = q*(-4*a*a/(D**3) + 24*a**3*μ*μ/(D**4))
+            Tμμ += Pμμ*B + 2*Pμ*Bμ + Pk*Bμμ
+            Tμs += Pμs*B + Pμ*Bs + Ps*Bμ + Pk*Bμs
+            Tss += Pss*B + 2*Ps*Bs + Pk*Bss
     # convert the s = σδ² derivatives to σδ:  d/dσδ = 2σδ d/ds,  d²/dσδ² = 4s d²/ds² + 2 d/ds
     return T, Tμ, Ts*2*σδ, Tμμ, Tμs*2*σδ, 4*s*Tss + 2*Ts
 
@@ -87,6 +90,8 @@ def F_kernel(μδ, σδ, order=2):
         return F, 0.0, 0.0, 0.0, 0.0, 0.0
     Fμ = - 1 / 2 * (1 - erf(μδ / h)) + tμ
     Fσ = exp(-(μδ/h)**2) * σδ / (sqrt(π) * h) + tσ
+    if order < 2:
+        return F, Fμ, Fσ, 0.0, 0.0, 0.0
     Fμμ = exp(-(μδ/h)**2) / (sqrt(π) * h) + tμμ
     Fμσ = - 2 * μδ * σδ * exp(-(μδ/h)**2) / (sqrt(π) * h**3) + tμσ
     Fσσ = exp(-(μδ/h)**2) * (256 + 4 * π * σδ**2 * (8 + π * μδ**2)) / (π**(5/2) * h**5) + tσσ
@@ -140,8 +145,10 @@ class TieModel():
 
 def basis_phi(A, μδ, σδ2):
     """Order-0 per-width basis integrals (φp, φq): E[e^{-a δ²}] and E[a δ² e^{-a δ²}] against
-    N(μδ, σδ²), vectorised over the widths A.  Mirrors bump_eval's order-0 kernel (and the C++
-    basis_phi); used by cavi so the w-update integrates exactly what eval integrates."""
+    N(μδ, σδ²) -- NOTE the third argument is the VARIANCE σδ², matching the C++ basis_phi.
+    Mirrors bump_eval's order-0 kernel; used by cavi so the w-update integrates exactly what eval
+    integrates.  Deliberately NOT substituted into bump_eval's order-0 loop: that loop's exact
+    summation order is bit-compatibility-gated by the line-search value path."""
     D = 1 + 2 * A * σδ2
     E = exp(-A * μδ**2 / D) / sqrt(D)
     return E, E * (A * μδ**2 / D**2 + A * σδ2 / D)
@@ -433,6 +440,24 @@ class VBayes():
         self.params[2 * self.n] = model.α
         self.params[2 * self.n + 1] = model.β
 
+    def _resolve_pairs(self, obs, tie_obs, pairs):
+        """Shared tie-observation guard.  With the tie model enabled an explicit tie_obs (or a
+        precomputed pairs dict) is required: the API cannot distinguish "no ties occurred" from
+        "forgot to pass them", and the silent path would quietly collapse the λ posterior.
+        Conversely, tie observations passed while the tie model is DISABLED would be silently
+        ignored, so that direction warns."""
+        if self.ties is None:
+            if tie_obs is not None and tie_obs.nnz > 0:
+                warnings.warn("tie_obs passed but the tie model is disabled (call enable_ties()); "
+                              "the tie observations are being IGNORED")
+            return None
+        if pairs is not None:
+            return pairs
+        if tie_obs is None:
+            raise ValueError("the tie model is enabled: pass tie_obs (coo_matrix((n, n)) if no "
+                             "ties were observed)")
+        return tie_pairs(obs, tie_obs, self.n)
+
     def enable_ties(self, path=None):
         """
         Enable the Davidson tie model: observations may then include ties (pass tie_obs to
@@ -607,20 +632,15 @@ class VBayes():
                 for j in range(self.n):
                     σδ = sqrt(σ[i]**2 + σ[j]**2)
                     μδ = μ[i] - μ[j]
-                    _, Fμ, Fσ, _, _, _ = F_kernel(μδ, σδ)
+                    _, Fμ, Fσ, _, _, _ = F_kernel(μδ, σδ, order=1)   # only first derivatives needed
                     dobs[i, j, 0] = Fσ / σδ
                     dobs[i, j, 1] = Fμ
 
-        if self.ties is not None:
-            if pairs is None:
-                if tie_obs is None:
-                    raise ValueError("the tie model is enabled: pass tie_obs (an empty coo_matrix "
-                                     "if no ties were observed)")
-                pairs = tie_pairs(obs, tie_obs, n)
-        else:
-            pairs = None
+        pairs = self._resolve_pairs(obs, tie_obs, pairs)
+        # zeros, not empty: skipped entries (diagonals) would otherwise leave uninitialized
+        # garbage at (0,0) that coo duplicate-summation folds into the Hessian
         l = 6 * len(obs.data) + (6 * len(pairs) if pairs is not None else 0)
-        gh.h_obs = coo_matrix((empty(l), (zeros(l,dtype=int32), zeros(l,dtype=int32))),shape=(2*n,2*n))
+        gh.h_obs = coo_matrix((zeros(l), (zeros(l,dtype=int32), zeros(l,dtype=int32))),shape=(2*n,2*n))
 
         k = 0
         order = 2 if compute_gradient else 0
@@ -760,11 +780,7 @@ class VBayes():
         σ, μ = self.σ(), self.μ()
         accp, accq = zeros(t.L), zeros(t.L)
         nt_tot = 0
-        if pairs is None:
-            if tie_obs is None:
-                raise ValueError("the tie model is enabled: pass tie_obs (an empty coo_matrix "
-                                 "if no ties were observed)")
-            pairs = tie_pairs(obs, tie_obs, self.n)
+        pairs = self._resolve_pairs(obs, tie_obs, pairs)
         for (a, b), (n_w, n_l, n_t) in pairs.items():
             c = n_w + n_l + n_t
             nt_tot += n_t
@@ -792,23 +808,24 @@ class VBayes():
         Keyword-only tail, in the same order as the C++ implementation.
         """
         if self.ties is not None:
-            if tie_obs is None:
-                # the API cannot distinguish "no ties occurred" from "forgot to pass them";
-                # require an explicit (possibly empty) tie matrix once the tie model is enabled
-                raise ValueError("the tie model is enabled: pass tie_obs (an empty coo_matrix if "
-                                 "no ties were observed)")
-            pairs = tie_pairs(obs, tie_obs, self.n)   # built once per fit, reused by eval and cavi
+            pairs = self._resolve_pairs(obs, tie_obs, None)   # built once per fit, reused throughout
             def step(t):
                 self.newton(obs, tol=t, max_iter=max_iter, verbose=verbose, λ0=λ0, λmax=λmax,
                             tie_obs=tie_obs, pairs=pairs)
+            loose = max(tol, sqrt(tol))               # intermediate rounds need not fully converge
             for _ in range(8):
-                step(max(tol, 1e-4))                  # intermediate rounds need not fully converge
+                step(loose)
                 if self.cavi(obs, tie_obs, pairs) < 1e-9:
                     break
             else:
                 warnings.warn("tie-weight alternation hit its 8-round cap without stationarity")
             step(tol)                                 # always end on a full-tolerance Newton pass
+            for _ in range(2):                        # re-certify weight stationarity against the
+                if self.cavi(obs, tie_obs, pairs) < 1e-9:   # FULL-tolerance scores
+                    break
+                step(tol)
             return
+        self._resolve_pairs(obs, tie_obs, None)       # warns if tie_obs is passed with ties off
         return self.newton(obs, tol=tol, max_iter=max_iter, verbose=verbose, λ0=λ0, λmax=λmax)
 
     def newton(self, obs, *, tol=1e-8, max_iter=100000, verbose=True, λ0 = 1e-10, λmax = 10000, tie_obs=None, pairs=None):
@@ -823,6 +840,8 @@ class VBayes():
             gh = self.eval(obs, compute_gradient=True, compute_hessian=True, tie_obs=tie_obs, pairs=pairs)
             # don't stop if we're still dampening the hessian, but do stop if it's gone too far
             if (last_val and abs(last_val - gh.val)/abs(gh.val) < tol and λ == λ0) or λ > λmax:
+                break
+            if np.linalg.norm(gh.g) < tol:   # already at the optimum (matches the C++ newton)
                 break
             last_val = gh.val
             λ = λ0
@@ -917,6 +936,10 @@ class VBayes():
         """
         Compute the KL divergence between the approximate posterior and the true posterior using Monte Carlo sampling
         """
+        if self.ties is not None:
+            # logP/logQ are Bradley-Terry only: they know neither the Davidson likelihood of tie
+            # observations nor the categorical λ factor, so the result would be silently wrong
+            raise NotImplementedError("KL does not support the tie model yet")
 
         cum_sum, cum_sum2 = 0, 0
         for i in range(max_iter):

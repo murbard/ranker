@@ -617,8 +617,8 @@ scores has the exact coordinate-ascent form
 \end{equation*}
 where $n_t$ is the total tie count and $c_{ij}$ the pair's comparison count. Fitting alternates
 Newton steps over $(\mu, \sigma, \alpha, \beta)$ with this closed-form update --- a handful of
-rounds in practice, at loosened intermediate tolerance, capped with a warning --- and always ends
-on a full-tolerance Newton pass, so the returned scores correspond to the stored weights. The
+rounds in practice, at loosened intermediate tolerance --- and always ends on a full-tolerance
+Newton pass, so the returned scores correspond to the stored weights. The
 update accumulates the $L$ per-pair basis integrals in a single pass over the
 observed pairs and then costs $O(JL)$ dot products: the pass over pairs does not grow with $J$.
 Active selection carries over by replacing the binary information gain with its three-outcome
